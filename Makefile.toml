@@ -1,0 +1,36 @@
+[config]
+default_to_workspace = false
+
+[tasks.tests]
+description = "Run tests (nextest)"
+script = '''
+# Use workspace nextest run to collect tests across workspace
+cargo nextest run --workspace --no-fail-fast --profile ci
+'''
+
+[tasks.coverage]
+description = "Generates an lcov coverage report"
+script = '''
+cargo llvm-cov --lcov --output-path target/lcov.info nextest --workspace --no-fail-fast
+'''
+
+[tasks.precommit]
+description = "Run pre-commit checks (fmt, clippy, tests, codespell)"
+script = '''
+# format check
+cargo fmt --all -- --check
+# clippy (do not fail on warnings yet)
+cargo clippy --all-targets --all-features
+# run test suite (nextest)
+cargo nextest run --workspace --no-fail-fast --profile ci
+# codespell (install if missing)
+python -m pip install --user codespell || true
+codespell --quiet-level=2 --skip="backup,target,.git"
+'''
+
+[tasks.docsserver]
+description = "Generate documentation and start a local server"
+script = '''
+cargo doc --workspace --lib --all-features --no-deps
+python -m http.server --directory target/doc
+'''

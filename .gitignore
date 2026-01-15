@@ -1,0 +1,9 @@
+./debug/
+target/
+**/*.rs.bk
+*.pdb
+.idea
+.DS_Store
+.vscode
+lcov.info
+README.crate.md

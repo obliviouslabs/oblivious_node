@@ -1,0 +1,36 @@
+[package]
+name = "eth_privatestate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio.workspace = true
+jsonrpsee.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+trie-db.workspace = true
+memory-db.workspace = true
+rlp.workspace = true
+hash-db.workspace = true
+sha3.workspace = true
+hex.workspace = true
+rostl-datastructures.workspace = true
+rostl-primitives.workspace = true
+rostl-sort.workspace = true
+rostl-oram.workspace = true
+bytemuck.workspace = true
+
+# Utils
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+bytes.workspace = true
+

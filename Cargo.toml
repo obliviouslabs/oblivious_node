@@ -1,0 +1,64 @@
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.84"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/obliviouslabs/eth_privatestate"
+homepage = "https://www.obliviouslabs.com/"
+exclude = ["./github/"]
+
+[workspace.metadata]
+platform = "x86_64"
+
+[workspace]
+resolver = "2"
+members = [
+  "crates/eth_privatestate",
+]
+
+
+[workspace.lints]
+rust.missing_docs = "warn"
+rust.unused_must_use = "deny"
+rustdoc.all = "warn"
+
+[workspace.lints.clippy]
+manual_range_contains = "allow"
+
+[workspace.dependencies]
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros"] }
+
+jsonrpsee = { version = "0.26", features = ["macros", "server" ] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0",  features = ["raw_value"] }
+
+trie-db = "0.31"
+memory-db = "0.34"
+rlp = "0.6"
+hash-db = "0.16"
+
+sha3 = "0.10"
+hex = "0.4"
+
+rostl-datastructures = "0.1.0-alpha8"
+rostl-primitives = "0.1.0-alpha8"
+rostl-sort = "0.1.0-alpha8"
+rostl-oram = "0.1.0-alpha8"
+bytemuck = "1.13"
+
+anyhow = "1.0"
+log = "0.4"
+env_logger = "0.11"
+
+# [workspace.dev-dependencies]
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+bytes = "1"
+
+
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = 3
