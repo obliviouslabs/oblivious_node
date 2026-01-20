@@ -24,7 +24,7 @@
 
 ## Design notes
 - Goal: make instruction and memory access patterns independent of clients' private inputs so proofs can be generated in constant time and with reduced leakage inside of TEEs.
-- Core types: `ObliviousNode` and oblivious helpers (branchless json and hex helpers, `oblivious_memcpy`, `oblivious_shift`) live in `crates/eth_privatestate/src/` (`oblivious_node.rs`, `utils.rs`, `trie.rs`, `rpc.rs`).
+- Core types: `ObliviousNode` and oblivious helpers (branchless json and hex helpers, `oblivious_memcpy`, `oblivious_shift`) live in `crates/eth_privatestate/src/` (`oblivious_node.rs`, `trie.rs`, `rpc.rs`).
 - Core logic: `ObliviousNode::traverse_oblivious` and `trie::generate_proof`.
 - Status: PoC — some helpers are marked `UNDONE()` and there are TODOs to move core oblivious primitives into [obliviouslabs/rostl](https://github.com/obliviouslabs/rostl).
 

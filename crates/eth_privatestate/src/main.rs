@@ -8,7 +8,6 @@ pub mod rpc;
 pub mod state;
 pub mod trie;
 pub mod types;
-pub mod utils;
 
 use std::sync::Arc;
 use std::time::Duration;

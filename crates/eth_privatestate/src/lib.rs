@@ -8,4 +8,3 @@ pub mod rpc;
 pub mod state;
 pub mod trie;
 pub mod types;
-pub mod utils;

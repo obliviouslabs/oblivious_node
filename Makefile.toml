@@ -23,8 +23,6 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features
 # run test suite (nextest)
 cargo nextest run --workspace --no-fail-fast --profile ci
-# codespell (install if missing)
-python -m pip install --user codespell || true
 codespell --quiet-level=2 --skip="backup,target,.git"
 '''
 

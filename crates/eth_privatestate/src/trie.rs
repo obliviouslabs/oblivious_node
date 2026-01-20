@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use bytemuck::Zeroable;
 use rostl_datastructures::map::UnsortedMap;
+use rostl_oram::linear_oram::oblivious_memcpy;
 use rostl_primitives::traits::Cmov;
 use tokio::sync::Mutex;
 
 use crate::oblivious_node::{ObliviousNode, NODE_BUF, VALUE_BUF};
 use crate::types::{bytes_to_hex_oblivious_hidden_size_quoted, B256};
-use crate::utils::oblivious_memcpy;
 
 const MAX_SLOTS: usize = 16;
 

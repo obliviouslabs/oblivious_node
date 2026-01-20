@@ -1,12 +1,12 @@
 //! Oblivious representation of a trie node and utils to traverse it.
 //
 use bytemuck::{Pod, Zeroable};
+use rostl_oram::linear_oram::oblivious_memcpy;
 use rostl_primitives::traits::{Cmov, _Cmovbase};
 use serde_json::value::RawValue;
 use sha3::{Digest, Keccak256};
 
 use crate::types::{bytes_to_hex_oblivious, nibble_to_hex_oblivious, B256};
-use crate::utils::oblivious_memcpy;
 
 /// Fixed buffer size for oblivious nodes (maximum size should be max(33*16 + 1, 33 + VALUE_BUF) + small k)
 pub const NODE_BUF: usize = 512 + 32 - 1; // 512 bytes + some extra slack so that Oblivious Node is aligned to 8 bytes without wasting space.
