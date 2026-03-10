@@ -88,7 +88,9 @@ impl ObliviousNode {
   }
   /// Decodes the type and size of an rlp inline node.
   /// Returns (type, size, start_offset)
-  /// Requires that size <= 0xffff
+  /// Supports long RLP lengths encoded with up to 2 bytes (`size <= 0xffff`).
+  /// Larger length-of-length encodings are treated as unsupported and returned
+  /// as an invalid zero-sized token (`tp = 0, size = 0, start = offset + 1`).
   pub fn rlp_decode_type_and_size(node_bytes: &[u8], offset: usize) -> (u8, usize, usize) {
     assert!(node_bytes.len() >= 3, "rlp_decode_type_and_size requires at least 3 bytes");
 
@@ -101,17 +103,22 @@ impl ObliviousNode {
 
     let long_len = {
       let mut long_len = 0usize;
-
-      // UNDONE(): Assertion disabled until we add an enabled flag to this function
-      // assert!(r_extraoffset <= 3, "UNDONE(): implement very large rlp encoding parsing");
       long_len.cmov(&(prefix2 as usize), r_extraoffset == 2);
       long_len.cmov(&((prefix2 as usize) << 8 | (prefix3 as usize)), r_extraoffset == 3);
       long_len
     };
 
-    rlen.cmov(&long_len, r_extraoffset > 1);
+    let unsupported_large_len = r_extraoffset > 3;
+    rlen.cmov(&long_len, (r_extraoffset > 1) & !unsupported_large_len);
+    rlen.cmov(&0, unsupported_large_len);
 
-    (tp, rlen, offset + r_extraoffset)
+    let mut tp = tp;
+    tp.cmov(&0, unsupported_large_len);
+
+    let mut start = offset + r_extraoffset;
+    start.cmov(&(offset + 1), unsupported_large_len);
+
+    (tp, rlen, start)
   }
 
   /// Traverse the inline node given an address we are parsing.
@@ -423,6 +430,19 @@ mod tests {
     assert_eq!(tp, 2);
     assert_eq!(size, 32);
     assert_eq!(start, 2);
+
+    // Unsupported large length-of-length (3 bytes for size) should be guarded.
+    let data = vec![0xbau8, 0x00, 0x01, 0x00];
+    let (tp, size, start) = ObliviousNode::rlp_decode_type_and_size(&data, 0);
+    assert_eq!(tp, 0);
+    assert_eq!(size, 0);
+    assert_eq!(start, 1);
+
+    let data = vec![0xfau8, 0x00, 0x01, 0x00];
+    let (tp, size, start) = ObliviousNode::rlp_decode_type_and_size(&data, 0);
+    assert_eq!(tp, 0);
+    assert_eq!(size, 0);
+    assert_eq!(start, 1);
   }
 
   #[test]
