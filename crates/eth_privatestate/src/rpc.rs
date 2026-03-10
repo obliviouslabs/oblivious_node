@@ -9,7 +9,7 @@ use serde_json::value::RawValue;
 
 use crate::oblivious_node::{ObliviousNode, VALUE_BUF};
 use crate::state::SharedState;
-use crate::trie::{self, parse_account};
+use crate::trie::{self, parse_account, ProofError};
 use crate::types::{B256, H160};
 
 #[derive(Clone, Deserialize, Debug)]
@@ -71,6 +71,45 @@ pub struct EthGetProofResult {
   pub storage_proof: Vec<StorageProof>,
 }
 
+fn invalid_hex_error(field: &str) -> ErrorObjectOwned {
+  ErrorObjectOwned::owned(-32602, format!("Failed to decode {} hex", field), None::<()>)
+}
+
+fn data_non_availability_error() -> ErrorObjectOwned {
+  ErrorObjectOwned::owned(-32001, "Failed due to data non availability".to_string(), None::<()>)
+}
+
+fn traversal_cap_exceeded_error() -> ErrorObjectOwned {
+  ErrorObjectOwned::owned(-32002, "Failed due to traversal cap exceeded".to_string(), None::<()>)
+}
+
+fn map_proof_error(err: ProofError) -> ErrorObjectOwned {
+  match err {
+    ProofError::MissingNode => data_non_availability_error(),
+    ProofError::TraversalCapExceeded => traversal_cap_exceeded_error(),
+  }
+}
+
+fn serialization_error<E: std::fmt::Display>(err: E) -> ErrorObjectOwned {
+  ErrorObjectOwned::owned(-32603, format!("Serialization error: {}", err), None::<()>)
+}
+
+fn decode_b256_hex(value: &str, field: &str) -> Result<B256, ErrorObjectOwned> {
+  let parsed = B256::from_hex(value);
+  if !parsed.is_some() {
+    return Err(invalid_hex_error(field));
+  }
+  Ok(parsed.unwrap_or_default())
+}
+
+fn decode_h160_hex(value: &str, field: &str) -> Result<H160, ErrorObjectOwned> {
+  let parsed = H160::from_hex(value);
+  if !parsed.is_some() {
+    return Err(invalid_hex_error(field));
+  }
+  Ok(parsed.unwrap())
+}
+
 /// Register all RPC methods onto a new `RpcModule` using the provided `state`.
 pub fn register_rpc(state: Arc<SharedState>) -> anyhow::Result<RpcModule<Arc<SharedState>>> {
   let mut module = RpcModule::new(state.clone());
@@ -117,15 +156,7 @@ pub fn register_rpc(state: Arc<SharedState>) -> anyhow::Result<RpcModule<Arc<Sha
       let (block_num, root_hex): (u64, String) = paramst
         .parse()
         .map_err(|_| ErrorObjectOwned::owned(-32602, "Invalid params".to_string(), None::<()>))?;
-      let root = B256::from_hex(&root_hex);
-      if !root.is_some() {
-        return Err(ErrorObjectOwned::owned(
-          -32602,
-          "Failed to decode root hex".to_string(),
-          None::<()>,
-        ));
-      }
-      let root_b256 = root.unwrap_or_default();
+      let root_b256 = decode_b256_hex(&root_hex, "root")?;
       state.set_root(block_num, root_b256).await;
       Ok::<_, ErrorObjectOwned>(true)
     }
@@ -137,25 +168,8 @@ pub fn register_rpc(state: Arc<SharedState>) -> anyhow::Result<RpcModule<Arc<Sha
       let (block_hash_hex, root_hex): (String, String) = paramst
         .parse()
         .map_err(|_| ErrorObjectOwned::owned(-32602, "Invalid params".to_string(), None::<()>))?;
-      let block_hash = B256::from_hex(&block_hash_hex);
-      if !block_hash.is_some() {
-        return Err(ErrorObjectOwned::owned(
-          -32602,
-          "Failed to decode block hash hex".to_string(),
-          None::<()>,
-        ));
-      }
-      let block_hash = block_hash.unwrap_or_default();
-
-      let root = B256::from_hex(&root_hex);
-      if !root.is_some() {
-        return Err(ErrorObjectOwned::owned(
-          -32602,
-          "Failed to decode root hex".to_string(),
-          None::<()>,
-        ));
-      }
-      let root_b256 = root.unwrap_or_default();
+      let block_hash = decode_b256_hex(&block_hash_hex, "block hash")?;
+      let root_b256 = decode_b256_hex(&root_hex, "root")?;
       state.set_root_by_hash(block_hash, root_b256).await;
       Ok::<_, ErrorObjectOwned>(true)
     }
@@ -170,109 +184,63 @@ pub async fn eth_get_proof_handler(
 ) -> Result<EthGetProofResultBoxed, ErrorObjectOwned> {
   let GetProofParams(address_hex, storage_keys, block_selector) = params;
 
-  // parse address
-  // UNDONE(): this should not be unwrap.
-  let address = H160::from_hex(&address_hex).unwrap().keccak_hash();
-  println!("Getting proof for address: {}", address_hex);
-  println!("Arrayed: {:x?}", address);
-  println!("Storage keys: {:?}", storage_keys);
+  // Parse all public request fields before touching trie state.
+  let address = decode_h160_hex(&address_hex, "address")?.keccak_hash();
+  let mut parsed_storage_keys: Vec<(String, B256)> = Vec::with_capacity(storage_keys.len());
+  for key_hex in storage_keys {
+    let key_hash = decode_b256_hex(&key_hex, "storage key")?.keccak_hash();
+    parsed_storage_keys.push((key_hex, key_hash));
+  }
 
   // get root for the requested block selector
   let root_opt = match block_selector {
     BlockSelector::Number(block_num) => state.get_root(block_num).await,
     BlockSelector::BlockHash(selector) => {
-      let block_hash = B256::from_hex(&selector.block_hash);
-      if !block_hash.is_some() {
-        return Err(ErrorObjectOwned::owned(
-          -32602,
-          "Failed to decode block hash hex".to_string(),
-          None::<()>,
-        ));
-      }
-      let block_hash = block_hash.unwrap_or_default();
+      let block_hash = decode_b256_hex(&selector.block_hash, "block hash")?;
       state.get_root_by_hash(block_hash).await
     }
   };
-  if root_opt.is_none() {
-    return Err(ErrorObjectOwned::owned(
-      -32001,
-      "Failed due to data non availability".to_string(),
-      None::<()>,
-    ));
-  }
-  let root = root_opt.unwrap();
-  println!("Using state root: {}", root.to_hex());
+  let root = root_opt.ok_or_else(data_non_availability_error)?;
 
   // generate account proof; if missing -> error
   let mut ret_proof = String::new();
   let mut ret_value = [0u8; VALUE_BUF];
-  let acct_proof_opt = trie::generate_proof::<64>(
+  trie::generate_proof::<64>(
     &state.storage,
     root,
     &address.to_nibbles(),
     &mut ret_proof,
     &mut ret_value,
   )
-  .await;
+  .await
+  .map_err(map_proof_error)?;
 
-  println!("Account proof RLP: {}", ret_proof);
-  // UNDONE(): this check leaks whether account exists.
-  if acct_proof_opt.is_none() {
-    return Err(ErrorObjectOwned::owned(
-      -32001,
-      "Failed due to data non availability".to_string(),
-      None::<()>,
-    ));
-  }
-
-  let account_proof_rv = RawValue::from_string(ret_proof).map_err(|e| {
-    ErrorObjectOwned::owned(-32603, format!("Serialization error: {}", e), None::<()>)
-  })?;
-  println!("Account proof RV: {:?}", account_proof_rv);
+  let account_proof_rv = RawValue::from_string(ret_proof).map_err(serialization_error)?;
 
   let (nonce, balance, storage_hash, code_hash) = parse_account(ret_value.as_slice());
 
   let mut storage_proofs = Vec::new();
-  for key_hex in storage_keys {
-    // UNDONE(): use oblivious hex decoding.
-    // UNDONE(): this should not be unwrap.
-    let key_bytes = B256::from_hex(&key_hex).unwrap().keccak_hash();
+  for (key_hex, key_hash) in parsed_storage_keys {
     let mut ret_proof = String::new();
     let mut ret_value = [0u8; VALUE_BUF];
-    let sp = trie::generate_proof::<64>(
+    trie::generate_proof::<64>(
       &state.storage,
       storage_hash,
-      &key_bytes.to_nibbles(),
+      &key_hash.to_nibbles(),
       &mut ret_proof,
       &mut ret_value,
     )
-    .await;
-    if sp.is_none() {
-      return Err(ErrorObjectOwned::owned(
-        -32001,
-        "Failed due to data non availability".to_string(),
-        None::<()>,
-      ));
-    }
-    let proof_rv = RawValue::from_string(ret_proof).map_err(|e| {
-      ErrorObjectOwned::owned(-32603, format!("Serialization error: {}", e), None::<()>)
-    })?;
+    .await
+    .map_err(map_proof_error)?;
+    let proof_rv = RawValue::from_string(ret_proof).map_err(serialization_error)?;
     // UNDONE(): parse value properly into hex
     let value_rv = trie::parse_value(ret_value.as_slice());
-    let value_rv = RawValue::from_string(value_rv).map_err(|e| {
-      ErrorObjectOwned::owned(-32603, format!("Serialization error: {}", e), None::<()>)
-    })?;
+    let value_rv = RawValue::from_string(value_rv).map_err(serialization_error)?;
     storage_proofs.push(StorageProofBoxed { key: key_hex, value: value_rv, proof: proof_rv });
   }
 
-  println!("Nonce: {}", nonce);
-  println!("Balance: {}", balance);
-  let nonce_rv = RawValue::from_string(nonce).map_err(|e| {
-    ErrorObjectOwned::owned(-32603, format!("Serialization error: {}", e), None::<()>)
-  })?;
-  let balance_rv = RawValue::from_string(balance).map_err(|e| {
-    ErrorObjectOwned::owned(-32603, format!("Serialization error: {}", e), None::<()>)
-  })?;
+  let nonce_rv = RawValue::from_string(nonce).map_err(serialization_error)?;
+  let balance_rv = RawValue::from_string(balance).map_err(serialization_error)?;
 
   let result = EthGetProofResultBoxed {
     nonce: nonce_rv,
@@ -323,6 +291,32 @@ mod tests {
     let err = res.err().unwrap();
     let msg = format!("{:?}", err);
     assert!(msg.contains("Failed due to data non availability"));
+  }
+
+  #[tokio::test]
+  async fn test_invalid_address_returns_invalid_params_error() {
+    let state = Arc::new(SharedState::new(1 << 10));
+    let params = GetProofParams("0x1234".to_string(), vec![], BlockSelector::Number(42));
+    let res = eth_get_proof_handler(params, state).await;
+    assert!(res.is_err());
+    let err = res.err().unwrap();
+    assert_eq!(err.code(), -32602);
+    assert!(err.message().contains("Failed to decode address hex"));
+  }
+
+  #[tokio::test]
+  async fn test_invalid_storage_key_returns_invalid_params_error() {
+    let state = Arc::new(SharedState::new(1 << 10));
+    let params = GetProofParams(
+      "0x0000000000000000000000000000000000000000".to_string(),
+      vec!["0x1234".to_string()],
+      BlockSelector::Number(42),
+    );
+    let res = eth_get_proof_handler(params, state).await;
+    assert!(res.is_err());
+    let err = res.err().unwrap();
+    assert_eq!(err.code(), -32602);
+    assert!(err.message().contains("Failed to decode storage key hex"));
   }
 
   #[tokio::test]

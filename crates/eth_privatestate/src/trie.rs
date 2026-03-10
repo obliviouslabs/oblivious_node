@@ -13,6 +13,12 @@ use crate::types::{bytes_to_hex_oblivious_hidden_size_quoted, B256};
 
 const MAX_SLOTS: usize = 16;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProofError {
+  MissingNode,
+  TraversalCapExceeded,
+}
+
 /// Generate proof by collecting RLP nodes into a fixed-size buffer and then
 /// perform oblivious compaction to move valid nodes to the front.
 ///
@@ -24,7 +30,7 @@ pub async fn generate_proof<const ADDR_LEN: usize>(
   key: &[u8],
   ret_proof: &mut String,
   ret_value: &mut [u8; VALUE_BUF],
-) -> Option<()> {
+) -> Result<(), ProofError> {
   // fixed-size slots with padding
   let mut slots: Vec<[u8; NODE_BUF]> = vec![[0u8; NODE_BUF]; MAX_SLOTS];
 
@@ -46,7 +52,7 @@ pub async fn generate_proof<const ADDR_LEN: usize>(
 
     // UNDONE(): Discuss how to handle missing nodes.
     if enabled & (ob_node.rlp_length == 0) {
-      return None;
+      return Err(ProofError::MissingNode);
     }
 
     ret_proof.push_str(unsafe {
@@ -70,7 +76,11 @@ pub async fn generate_proof<const ADDR_LEN: usize>(
   }
   ret_proof.push(']');
 
-  Some(())
+  if enabled {
+    return Err(ProofError::TraversalCapExceeded);
+  }
+
+  Ok(())
 }
 
 pub fn parse_account(rlp_bytes: &[u8]) -> (String, String, B256, B256) {
@@ -155,7 +165,7 @@ mod tests {
     // Call generate_proof with a non-significant root hash (function currently uses stored zeros)
     let res =
       generate_proof::<2>(&storage, ob.keccak_hash(), &key, &mut ret_proof, &mut ret_value).await;
-    assert!(res.is_some(), "proof should be generated");
+    assert!(res.is_ok(), "proof should be generated");
 
     // Value is copied into ret_value starting at index 1
     assert_eq!(&ret_value[1..1 + value.len()], &value[..]);
@@ -173,7 +183,11 @@ mod tests {
 
     let res =
       generate_proof::<2>(&storage, B256::zero(), &key, &mut ret_proof, &mut ret_value).await;
-    assert!(res.is_none(), "missing nodes should cause generate_proof to return None");
+    assert_eq!(
+      res,
+      Err(ProofError::MissingNode),
+      "missing nodes should cause generate_proof to return MissingNode"
+    );
   }
 
   #[tokio::test]
@@ -196,7 +210,7 @@ mod tests {
 
     let root_hash = root_ob.keccak_hash();
     let res = generate_proof::<2>(&storage, root_hash, &key, &mut ret_proof, &mut ret_value).await;
-    assert!(res.is_some(), "proof should be generated");
+    assert!(res.is_ok(), "proof should be generated");
 
     // Value should be copied into ret_value
     assert_eq!(&ret_value, &[0u8; VALUE_BUF]);
@@ -236,7 +250,7 @@ mod tests {
 
     let root_hash = ObliviousNode::from_rlp(&nodes[0]).unwrap().keccak_hash();
     let res = generate_proof::<61>(&storage, root_hash, &key, &mut ret_proof, &mut ret_value).await;
-    assert!(res.is_some(), "proof should be generated");
+    assert!(res.is_ok(), "proof should be generated");
 
     // Proof should contain at least three quoted node hex entries (one per level)
     let occurrences = ret_proof.matches("\"0x").count();
@@ -280,7 +294,7 @@ mod tests {
     let res =
       generate_proof::<64>(&storage, root_hash, &key.to_nibbles(), &mut ret_proof, &mut ret_value)
         .await;
-    assert!(res.is_some(), "proof should be generated");
+    assert!(res.is_ok(), "proof should be generated");
 
     // Proof should contain at least three quoted node hex entries (one per level)
     let occurrences = ret_proof.matches("\"0x").count();
@@ -355,7 +369,7 @@ mod tests {
 
     let res =
       generate_proof::<3>(&storage, B256::zero(), &key, &mut ret_proof, &mut ret_value).await;
-    assert!(res.is_some(), "proof should be generated for three-level chain");
+    assert!(res.is_ok(), "proof should be generated for three-level chain");
 
     // Value should be copied into ret_value
     assert_eq!(&ret_value[1..1 + leaf_value.len()], &leaf_value[..]);
@@ -363,5 +377,39 @@ mod tests {
     // Proof should contain at least three quoted node hex entries (one per level)
     let occurrences = ret_proof.matches("\"0x").count();
     assert!(occurrences >= 3, "expected at least 3 nodes in proof, got {}", occurrences);
+  }
+
+  #[tokio::test]
+  async fn test_generate_proof_cap_exceeded_returns_error() {
+    // Build one branch node that points to a fixed 32-byte child hash at nibble 0.
+    // Insert the same node under both the root hash and the child hash so traversal
+    // can keep advancing until MAX_SLOTS is exhausted.
+    let child_hash = [0x77u8; 32];
+    let mut s = RlpStream::new_list(17);
+    for i in 0..16 {
+      if i == 0 {
+        s.append(&child_hash.as_ref());
+      } else {
+        s.append(&"");
+      }
+    }
+    s.append(&"");
+    let out = s.out();
+    let ob = ObliviousNode::from_rlp(&out).expect("should parse branch");
+    let root_hash = ob.keccak_hash();
+
+    let storage = Arc::new(Mutex::new(UnsortedMap::<B256, ObliviousNode>::new(1 << 10)));
+    {
+      let mut guard = storage.lock().await;
+      guard.insert(root_hash, ob);
+      guard.insert(B256(child_hash), ob);
+    }
+
+    // Request longer than MAX_SLOTS depth along nibble 0 path.
+    let key = [0u8; 32];
+    let mut ret_proof = String::new();
+    let mut ret_value = [0u8; VALUE_BUF];
+    let res = generate_proof::<32>(&storage, root_hash, &key, &mut ret_proof, &mut ret_value).await;
+    assert_eq!(res, Err(ProofError::TraversalCapExceeded));
   }
 }
