@@ -86,6 +86,41 @@ impl ObliviousNode {
 
     (tp, rlen, r_extraoffset)
   }
+
+  /// Fast prefix decoder for branch-child elements.
+  ///
+  /// Expected forms in branch children:
+  /// - inline byte (`0x00..=0x7f`)
+  /// - short string (`0x80..=0xb7`)
+  /// - short list (`0xc0..=0xf7`)
+  ///
+  /// Long forms are unsupported in this context and return an invalid token
+  /// (`tp = 0, size = 0, start = 1`) so traversal stays safe.
+  #[inline]
+  fn rlp_decode_type_and_size_from_prefix_branch_child(prefix: u8) -> (u8, usize, usize) {
+    let mut tp = 0u8;
+    let mut rlen = 0usize;
+    let mut start = 1usize;
+
+    let is_inline_char = prefix <= 0x7f;
+    let is_short_string = (prefix > 0x7f) & (prefix <= 0xb7);
+    let is_short_list = (prefix >= 0xc0) & (prefix <= 0xf7);
+    let is_supported = is_inline_char | is_short_string | is_short_list;
+
+    tp.cmov(&1u8, is_inline_char | is_short_string);
+    tp.cmov(&2u8, is_short_list);
+
+    rlen.cmov(&1usize, is_inline_char);
+    rlen.cmov(&((prefix as usize).wrapping_sub(0x80)), is_short_string);
+    rlen.cmov(&((prefix as usize).wrapping_sub(0xc0)), is_short_list);
+    start.cmov(&0usize, is_inline_char);
+
+    tp.cmov(&0u8, !is_supported);
+    rlen.cmov(&0usize, !is_supported);
+    start.cmov(&1usize, !is_supported);
+
+    (tp, rlen, start)
+  }
   /// Decodes the type and size of an rlp inline node.
   /// Returns (type, size, start_offset)
   /// Supports long RLP lengths encoded with up to 2 bytes (`size <= 0xffff`).
@@ -243,9 +278,8 @@ impl ObliviousNode {
     let mut state_target_offset = 0;
     for (i, curr_byte) in self.rlp_encoded.iter().enumerate() {
       let inside_encoding = enabled & is_branch_node & (i < size + start);
-
-      // UNDONE(): we can create a specialization of rlp_decode_type_and_size_from_prefix that only checks for short types, since branch children cannot be long types.
-      let (_tp_new, size_new, start_new) = Self::rlp_decode_type_and_size_from_prefix(*curr_byte);
+      let (_tp_new, size_new, start_new) =
+        Self::rlp_decode_type_and_size_from_prefix_branch_child(*curr_byte);
 
       let at_element_start = inside_encoding & (state_curr_remaining == 0);
       let at_target_element_start =
@@ -443,6 +477,21 @@ mod tests {
     assert_eq!(tp, 0);
     assert_eq!(size, 0);
     assert_eq!(start, 1);
+  }
+
+  #[test]
+  fn test_rlp_decode_type_and_size_from_prefix_branch_child() {
+    // Supported forms should match the generic prefix decoder.
+    let supported = [0x00u8, 0x7f, 0x80, 0xa0, 0xb7, 0xc0, 0xf7];
+    for p in supported {
+      let generic = ObliviousNode::rlp_decode_type_and_size_from_prefix(p);
+      let branch = ObliviousNode::rlp_decode_type_and_size_from_prefix_branch_child(p);
+      assert_eq!(generic, branch, "supported prefix mismatch for {:02x}", p);
+    }
+
+    // Long forms are unsupported for branch-child decoding.
+    assert_eq!(ObliviousNode::rlp_decode_type_and_size_from_prefix_branch_child(0xb8), (0, 0, 1));
+    assert_eq!(ObliviousNode::rlp_decode_type_and_size_from_prefix_branch_child(0xfa), (0, 0, 1));
   }
 
   #[test]
