@@ -27,8 +27,9 @@ pub enum BlockSelector {
   /// Block number selector (e.g. `1`).
   Number(u64),
   /// Block hash selector object (e.g. `{"blockHash":"0x...", "requireCanonical": false}`).
-  /// UNDONE(): Named tags like `"latest"` are currently unsupported.
   BlockHash(BlockHashSelector),
+  /// Named block selector tag (currently only `"latest"`).
+  Tag(String),
 }
 
 /// RPC params for `eth_getProof`: (address, storage_keys, block_selector)
@@ -139,6 +140,26 @@ fn decode_h160_hex(value: &str, field: &str) -> Result<H160, ErrorObjectOwned> {
     return Err(invalid_hex_error(field));
   }
   Ok(parsed.unwrap())
+}
+
+async fn resolve_root_for_selector(
+  state: &SharedState,
+  block_selector: BlockSelector,
+) -> Result<Option<B256>, ErrorObjectOwned> {
+  match block_selector {
+    BlockSelector::Number(block_num) => Ok(state.get_root(block_num).await),
+    BlockSelector::BlockHash(selector) => {
+      if selector.require_canonical == Some(true) {
+        return Err(unsupported_error("requireCanonical=true is unsupported"));
+      }
+      let block_hash = decode_b256_hex(&selector.block_hash, "block hash")?;
+      Ok(state.get_root_by_hash(block_hash).await)
+    }
+    BlockSelector::Tag(tag) => match tag.as_str() {
+      "latest" => Ok(state.get_latest_root().await),
+      _ => Err(unsupported_error("Unsupported block tag")),
+    },
+  }
 }
 
 /// Register all RPC methods onto a new `RpcModule` using the provided `state`.
@@ -256,16 +277,7 @@ pub async fn eth_get_proof_handler(
   }
 
   // get root for the requested block selector
-  let root_opt = match block_selector {
-    BlockSelector::Number(block_num) => state.get_root(block_num).await,
-    BlockSelector::BlockHash(selector) => {
-      if selector.require_canonical == Some(true) {
-        return Err(unsupported_error("requireCanonical=true is unsupported"));
-      }
-      let block_hash = decode_b256_hex(&selector.block_hash, "block hash")?;
-      state.get_root_by_hash(block_hash).await
-    }
-  };
+  let root_opt = resolve_root_for_selector(state.as_ref(), block_selector).await?;
   let root = root_opt.ok_or_else(data_non_availability_error)?;
 
   // generate account proof; if missing -> error
@@ -490,5 +502,35 @@ mod tests {
     let err = res.err().unwrap();
     assert_eq!(err.code(), -32001);
     assert!(err.message().contains("data non availability"));
+  }
+
+  #[tokio::test]
+  async fn test_latest_tag_without_root_returns_data_non_availability_error() {
+    let state = Arc::new(SharedState::new(1 << 10));
+    let params = GetProofParams(
+      "0x0000000000000000000000000000000000000000".to_string(),
+      vec![],
+      BlockSelector::Tag("latest".to_string()),
+    );
+    let res = eth_get_proof_handler(params, state).await;
+    assert!(res.is_err());
+    let err = res.err().unwrap();
+    assert_eq!(err.code(), -32001);
+    assert!(err.message().contains("data non availability"));
+  }
+
+  #[tokio::test]
+  async fn test_unsupported_block_tag_returns_invalid_params_error() {
+    let state = Arc::new(SharedState::new(1 << 10));
+    let params = GetProofParams(
+      "0x0000000000000000000000000000000000000000".to_string(),
+      vec![],
+      BlockSelector::Tag("earliest".to_string()),
+    );
+    let res = eth_get_proof_handler(params, state).await;
+    assert!(res.is_err());
+    let err = res.err().unwrap();
+    assert_eq!(err.code(), -32602);
+    assert!(err.message().contains("Unsupported block tag"));
   }
 }

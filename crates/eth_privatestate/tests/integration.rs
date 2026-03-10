@@ -338,7 +338,15 @@ async fn integration_rpc_eth_insert_getproof() {
     .expect("missing accountProof")
     .as_array()
     .expect("accountProof not array");
-  // presence is sufficient for this test (PoC)
+  // Also validate the named "latest" selector uses the latest numeric root.
+  let (status, _body) =
+    send_rpc_request(&srv.url, "admin_set_root", json!([2, root_hex]), 14).await;
+  assert!(status.is_success());
+  let params = json!(["0xdAC17F958D2ee523a2206206994597C13D831ec7", [], "latest"]);
+  let (status, body) = send_rpc_request(&srv.url, "eth_getProof", params, 15).await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(is_valid_response_for_keys(&rpc, &[]));
 }
 
 #[tokio::test]
@@ -410,7 +418,8 @@ async fn integration_rpc_eth_getproof_selector_error_matrix() {
   let addr_hex = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
 
   let cases = vec![
-    (json!("latest"), -32602, "Invalid params"),
+    (json!("latest"), -32001, "data non availability"),
+    (json!("earliest"), -32602, "Unsupported block tag"),
     (json!({}), -32602, "Invalid params"),
     (json!({"blockHash": 123}), -32602, "Invalid params"),
     (json!({"blockHash": "0x1234"}), -32602, "Failed to decode block hash hex"),

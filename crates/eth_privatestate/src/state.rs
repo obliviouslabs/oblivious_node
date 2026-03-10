@@ -74,6 +74,8 @@ pub struct SharedState {
   pub storage: Arc<Mutex<UnsortedMap<B256, ObliviousNode>>>,
   /// block_number -> state_root
   pub roots_by_number: Arc<Mutex<UnsortedMap<u64, B256>>>,
+  /// latest root set via `admin_set_root` (block_number, state_root)
+  pub latest_root_by_number: Arc<Mutex<Option<(u64, B256)>>>,
   /// block_hash -> state_root
   pub roots_by_hash: Arc<Mutex<UnsortedMap<B256, B256>>>,
   pub metrics: Arc<Mutex<RpcMetrics>>,
@@ -84,6 +86,7 @@ impl SharedState {
     Self {
       storage: Arc::new(Mutex::new(UnsortedMap::new(1 << 10))),
       roots_by_number: Arc::new(Mutex::new(UnsortedMap::new(cap))),
+      latest_root_by_number: Arc::new(Mutex::new(None)),
       roots_by_hash: Arc::new(Mutex::new(UnsortedMap::new(cap))),
       metrics: Arc::new(Mutex::new(RpcMetrics::default())),
     }
@@ -92,6 +95,13 @@ impl SharedState {
   pub async fn set_root(&self, block: u64, root: B256) {
     let mut guard = self.roots_by_number.lock().await;
     guard.insert(block, root);
+
+    let mut latest_guard = self.latest_root_by_number.lock().await;
+    let should_update =
+      latest_guard.as_ref().map_or(true, |(latest_block, _)| block >= *latest_block);
+    if should_update {
+      *latest_guard = Some((block, root));
+    }
   }
 
   // NOTE: We are leaking whether the root exists or not, this is acceptable as we don't care about hiding data in invalid requests.
@@ -121,6 +131,10 @@ impl SharedState {
     } else {
       None
     }
+  }
+
+  pub async fn get_latest_root(&self) -> Option<B256> {
+    self.latest_root_by_number.lock().await.as_ref().map(|(_, root)| *root)
   }
 
   pub async fn metrics_snapshot(&self) -> RpcMetrics {
@@ -156,6 +170,28 @@ mod tests {
 
     assert_eq!(state.get_root_by_hash(block_hash).await, Some(root));
     assert_eq!(state.get_root_by_hash(B256([0x11; 32])).await, None);
+  }
+
+  #[tokio::test]
+  async fn test_set_and_get_latest_root_by_number() {
+    let state = SharedState::new(1 << 10);
+    let root_100 =
+      B256::from_hex("1111111111111111111111111111111111111111111111111111111111111111").unwrap();
+    let root_101 =
+      B256::from_hex("2222222222222222222222222222222222222222222222222222222222222222").unwrap();
+    let root_099 =
+      B256::from_hex("3333333333333333333333333333333333333333333333333333333333333333").unwrap();
+
+    assert_eq!(state.get_latest_root().await, None);
+
+    state.set_root(100, root_100).await;
+    assert_eq!(state.get_latest_root().await, Some(root_100));
+
+    state.set_root(99, root_099).await;
+    assert_eq!(state.get_latest_root().await, Some(root_100));
+
+    state.set_root(101, root_101).await;
+    assert_eq!(state.get_latest_root().await, Some(root_101));
   }
 
   #[test]
