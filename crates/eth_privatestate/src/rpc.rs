@@ -240,7 +240,6 @@ pub async fn eth_get_proof_handler(
     .await
     .map_err(map_proof_error)?;
     let proof_rv = RawValue::from_string(ret_proof).map_err(serialization_error)?;
-    // UNDONE(): parse value properly into hex
     let value_rv = trie::parse_value(ret_value.as_slice());
     let value_rv = RawValue::from_string(value_rv).map_err(serialization_error)?;
     storage_proofs.push(StorageProofBoxed { key: key_hex, value: value_rv, proof: proof_rv });
@@ -283,6 +282,7 @@ pub async fn start_rpc(state: Arc<SharedState>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use rlp::RlpStream;
   use std::sync::Arc;
 
   #[tokio::test]
@@ -298,6 +298,58 @@ mod tests {
     let err = res.err().unwrap();
     let msg = format!("{:?}", err);
     assert!(msg.contains("Failed due to data non availability"));
+  }
+
+  #[tokio::test]
+  async fn test_missing_node_maps_to_data_non_availability_error() {
+    let state = Arc::new(SharedState::new(1 << 10));
+    // Set a root that does not exist in `state.storage`.
+    state.set_root(1, B256([0x11; 32])).await;
+    let params = GetProofParams(
+      "0x0000000000000000000000000000000000000000".to_string(),
+      vec![],
+      BlockSelector::Number(1),
+    );
+    let res = eth_get_proof_handler(params, state).await;
+    assert!(res.is_err());
+    let err = res.err().unwrap();
+    assert_eq!(err.code(), -32001);
+    assert!(err.message().contains("data non availability"));
+  }
+
+  #[tokio::test]
+  async fn test_traversal_cap_maps_to_traversal_cap_error() {
+    let state = Arc::new(SharedState::new(1 << 10));
+
+    // Build one branch node where every child points to `child_hash`.
+    // Inserting the same node under both `root_hash` and `child_hash` creates
+    // a cycle that always advances one nibble per step until max slots are hit.
+    let child_hash = [0x77u8; 32];
+    let mut s = RlpStream::new_list(17);
+    for _ in 0..16 {
+      s.append(&child_hash.as_ref());
+    }
+    s.append(&"");
+    let node_bytes = s.out();
+    let ob = ObliviousNode::from_rlp(&node_bytes).unwrap();
+    let root_hash = ob.keccak_hash();
+    {
+      let mut guard = state.storage.lock().await;
+      guard.insert(root_hash, ob);
+      guard.insert(B256(child_hash), ob);
+    }
+    state.set_root(1, root_hash).await;
+
+    let params = GetProofParams(
+      "0x0000000000000000000000000000000000000000".to_string(),
+      vec![],
+      BlockSelector::Number(1),
+    );
+    let res = eth_get_proof_handler(params, state).await;
+    assert!(res.is_err());
+    let err = res.err().unwrap();
+    assert_eq!(err.code(), -32002);
+    assert!(err.message().contains("traversal cap exceeded"));
   }
 
   #[tokio::test]
