@@ -1,6 +1,7 @@
 //! RPC methods for EthPrivateState.
 //!
 use std::sync::Arc;
+use std::time::Instant;
 
 use jsonrpsee::server::{RpcModule, ServerBuilder};
 use jsonrpsee::types::error::ErrorObjectOwned;
@@ -101,6 +102,29 @@ fn serialization_error<E: std::fmt::Display>(err: E) -> ErrorObjectOwned {
   ErrorObjectOwned::owned(-32603, format!("Serialization error: {}", err), None::<()>)
 }
 
+async fn observe_rpc_result<T>(
+  state: &SharedState,
+  method: &'static str,
+  started: Instant,
+  res: &Result<T, ErrorObjectOwned>,
+) {
+  let ok = res.is_ok();
+  let err_code = if ok { 0 } else { res.as_ref().err().map(|e| e.code()).unwrap_or_default() };
+  let latency_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+
+  {
+    let mut metrics = state.metrics.lock().await;
+    metrics.record_oblivious(ok, err_code, latency_us);
+  }
+  log::info!(
+    "event=rpc_call method={} status={} code={} latency_us={}",
+    method,
+    if ok { "ok" } else { "err" },
+    err_code,
+    latency_us
+  );
+}
+
 fn decode_b256_hex(value: &str, field: &str) -> Result<B256, ErrorObjectOwned> {
   let parsed = B256::from_hex(value);
   if !parsed.is_some() {
@@ -124,10 +148,13 @@ pub fn register_rpc(state: Arc<SharedState>) -> anyhow::Result<RpcModule<Arc<Sha
   module.register_async_method("eth_getProof", move |params, ctx, _| {
     let state = ctx.as_ref().clone();
     async move {
-      let p: GetProofParams = params
-        .parse()
-        .map_err(|_| ErrorObjectOwned::owned(-32602, "Invalid params".to_string(), None::<()>))?;
-      eth_get_proof_handler(p, state).await
+      let started = Instant::now();
+      let res = match params.parse::<GetProofParams>() {
+        Ok(p) => eth_get_proof_handler(p, state.clone()).await,
+        Err(_) => Err(ErrorObjectOwned::owned(-32602, "Invalid params".to_string(), None::<()>)),
+      };
+      observe_rpc_result(state.as_ref(), "eth_getProof", started, &res).await;
+      res
     }
   })?;
 
@@ -136,49 +163,78 @@ pub fn register_rpc(state: Arc<SharedState>) -> anyhow::Result<RpcModule<Arc<Sha
   module.register_async_method("admin_put_node", move |params, ctx, _| {
     let state = ctx.as_ref().clone();
     async move {
-      let node_hex: String = params
-        .parse()
-        .map_err(|_| ErrorObjectOwned::owned(-32602, "Invalid params".to_string(), None::<()>))?;
-      let node_bytes = hex::decode(node_hex.trim_start_matches("0x")).map_err(|_| {
-        ErrorObjectOwned::owned(-32602, "Failed to decode node hex".to_string(), None::<()>)
-      })?;
-      // Parse RLP into ObliviousNode and insert into in-memory storage
-      let ob = ObliviousNode::from_rlp(&node_bytes).ok_or(ErrorObjectOwned::owned(
-        -32602,
-        "Failed to parse node RLP into ObliviousNode".to_string(),
-        None::<()>,
-      ))?;
-      let hh = ob.keccak_hash();
-      {
-        let mut guard = state.storage.lock().await;
-        guard.insert(hh, ob);
+      let started = Instant::now();
+      let res: Result<bool, ErrorObjectOwned> = async {
+        let node_hex: String = params
+          .parse()
+          .map_err(|_| ErrorObjectOwned::owned(-32602, "Invalid params".to_string(), None::<()>))?;
+        let node_bytes = hex::decode(node_hex.trim_start_matches("0x")).map_err(|_| {
+          ErrorObjectOwned::owned(-32602, "Failed to decode node hex".to_string(), None::<()>)
+        })?;
+        // Parse RLP into ObliviousNode and insert into in-memory storage
+        let ob = ObliviousNode::from_rlp(&node_bytes).ok_or(ErrorObjectOwned::owned(
+          -32602,
+          "Failed to parse node RLP into ObliviousNode".to_string(),
+          None::<()>,
+        ))?;
+        let hh = ob.keccak_hash();
+        {
+          let mut guard = state.storage.lock().await;
+          guard.insert(hh, ob);
+        }
+        Ok::<_, ErrorObjectOwned>(true)
       }
-      Ok::<_, ErrorObjectOwned>(true)
+      .await;
+      observe_rpc_result(state.as_ref(), "admin_put_node", started, &res).await;
+      res
     }
   })?;
 
   module.register_async_method("admin_set_root", move |paramst, ctx, _| {
     let state = ctx.as_ref().clone();
     async move {
-      let (block_num, root_hex): (u64, String) = paramst
-        .parse()
-        .map_err(|_| ErrorObjectOwned::owned(-32602, "Invalid params".to_string(), None::<()>))?;
-      let root_b256 = decode_b256_hex(&root_hex, "root")?;
-      state.set_root(block_num, root_b256).await;
-      Ok::<_, ErrorObjectOwned>(true)
+      let started = Instant::now();
+      let res: Result<bool, ErrorObjectOwned> = async {
+        let (block_num, root_hex): (u64, String) = paramst
+          .parse()
+          .map_err(|_| ErrorObjectOwned::owned(-32602, "Invalid params".to_string(), None::<()>))?;
+        let root_b256 = decode_b256_hex(&root_hex, "root")?;
+        state.set_root(block_num, root_b256).await;
+        Ok::<_, ErrorObjectOwned>(true)
+      }
+      .await;
+      observe_rpc_result(state.as_ref(), "admin_set_root", started, &res).await;
+      res
     }
   })?;
 
   module.register_async_method("admin_set_root_by_hash", move |paramst, ctx, _| {
     let state = ctx.as_ref().clone();
     async move {
-      let (block_hash_hex, root_hex): (String, String) = paramst
-        .parse()
-        .map_err(|_| ErrorObjectOwned::owned(-32602, "Invalid params".to_string(), None::<()>))?;
-      let block_hash = decode_b256_hex(&block_hash_hex, "block hash")?;
-      let root_b256 = decode_b256_hex(&root_hex, "root")?;
-      state.set_root_by_hash(block_hash, root_b256).await;
-      Ok::<_, ErrorObjectOwned>(true)
+      let started = Instant::now();
+      let res: Result<bool, ErrorObjectOwned> = async {
+        let (block_hash_hex, root_hex): (String, String) = paramst
+          .parse()
+          .map_err(|_| ErrorObjectOwned::owned(-32602, "Invalid params".to_string(), None::<()>))?;
+        let block_hash = decode_b256_hex(&block_hash_hex, "block hash")?;
+        let root_b256 = decode_b256_hex(&root_hex, "root")?;
+        state.set_root_by_hash(block_hash, root_b256).await;
+        Ok::<_, ErrorObjectOwned>(true)
+      }
+      .await;
+      observe_rpc_result(state.as_ref(), "admin_set_root_by_hash", started, &res).await;
+      res
+    }
+  })?;
+
+  module.register_async_method("admin_get_metrics", move |params, ctx, _| {
+    let state = ctx.as_ref().clone();
+    async move {
+      let started = Instant::now();
+      let _ = params;
+      let res: Result<_, ErrorObjectOwned> = Ok(state.metrics_snapshot().await);
+      observe_rpc_result(state.as_ref(), "admin_get_metrics", started, &res).await;
+      res
     }
   })?;
 

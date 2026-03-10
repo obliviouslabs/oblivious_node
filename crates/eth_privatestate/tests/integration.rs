@@ -568,3 +568,60 @@ async fn integration_rpc_invalid_params_returns_error() {
   let err = rpc.error.expect("expected error object for invalid params");
   assert!(err.code == -32602 || err.message.contains("Invalid params"));
 }
+
+#[tokio::test]
+async fn integration_rpc_admin_get_metrics_reports_counters() {
+  let (srv, _state) = TestServer::start(1 << 10).await;
+
+  let root_hex = B256([0x11; 32]).to_hex();
+  let (status, body) =
+    send_rpc_request(&srv.url, "admin_set_root", json!([1, root_hex]), 2001).await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(rpc.error.is_none(), "admin_set_root should succeed");
+
+  let (status, body) = send_rpc_request(&srv.url, "admin_put_node", json!("0xzz"), 2002).await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert_rpc_error(&rpc, -32602, "Failed to decode node hex");
+
+  let (status, body) = send_rpc_request(
+    &srv.url,
+    "eth_getProof",
+    json!([12345, "not-an-array", "not-a-number"]),
+    2003,
+  )
+  .await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert_rpc_error(&rpc, -32602, "Invalid params");
+
+  let (status, body) = send_rpc_request(&srv.url, "admin_get_metrics", json!([]), 2004).await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(rpc.error.is_none(), "admin_get_metrics should succeed");
+  let metrics = rpc.result.as_ref().expect("missing metrics result");
+  let m = metrics.as_object().expect("metrics result not object");
+
+  assert_eq!(m.get("requests_total").and_then(|v| v.as_u64()), Some(3));
+  assert_eq!(m.get("requests_ok").and_then(|v| v.as_u64()), Some(1));
+  assert_eq!(m.get("requests_err").and_then(|v| v.as_u64()), Some(2));
+
+  assert_eq!(m.get("errors_invalid_params").and_then(|v| v.as_u64()), Some(2));
+  assert_eq!(m.get("errors_data_non_availability").and_then(|v| v.as_u64()), Some(0));
+  assert_eq!(m.get("errors_traversal_cap_exceeded").and_then(|v| v.as_u64()), Some(0));
+  assert_eq!(m.get("errors_other").and_then(|v| v.as_u64()), Some(0));
+
+  let latency_count =
+    m.get("latency_count").and_then(|v| v.as_u64()).expect("missing latency_count");
+  let latency_total_us =
+    m.get("latency_total_us").and_then(|v| v.as_u64()).expect("missing latency_total_us");
+  let latency_max_us =
+    m.get("latency_max_us").and_then(|v| v.as_u64()).expect("missing latency_max_us");
+  let latency_avg_us =
+    m.get("latency_avg_us").and_then(|v| v.as_u64()).expect("missing latency_avg_us");
+
+  assert_eq!(latency_count, 3);
+  assert!(latency_total_us >= latency_max_us);
+  assert_eq!(latency_avg_us, latency_total_us / latency_count);
+}
