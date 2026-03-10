@@ -103,14 +103,78 @@ async fn send_eth_get_proof(
   send_rpc_request(url, "eth_getProof", params, id).await
 }
 
-// Dummy proof validator - placeholder that always returns true for now. Replace
-// with actual proof verification logic when implemented.
-fn validate_proof_dummy(_proof_vec: &Vec<String>) -> bool {
+/// Basic structural validator for proof node vectors:
+/// each entry must be `0x` hex, valid RLP list, and list arity 2 or 17.
+fn validate_proof_nodes(proof_vec: &[String]) -> bool {
+  for node_hex in proof_vec.iter() {
+    let body = match node_hex.strip_prefix("0x") {
+      Some(v) => v,
+      None => return false,
+    };
+    let node_bytes = match hex::decode(body) {
+      Ok(v) => v,
+      Err(_) => return false,
+    };
+    if node_bytes.is_empty() {
+      return false;
+    }
+    let r = rlp::Rlp::new(&node_bytes);
+    if !r.is_list() {
+      return false;
+    }
+    let arity = match r.item_count() {
+      Ok(v) => v,
+      Err(_) => return false,
+    };
+    if arity != 2 && arity != 17 {
+      return false;
+    }
+  }
   true
 }
 
+/// Extract account `storage_root` from an account proof node sequence.
+/// This is a structural consistency check only (not full trie-proof verification).
+fn extract_account_storage_root(account_proof: &[String]) -> Option<B256> {
+  for node_hex in account_proof.iter().rev() {
+    let body = node_hex.strip_prefix("0x")?;
+    let node_bytes = hex::decode(body).ok()?;
+    let node = rlp::Rlp::new(&node_bytes);
+    if !node.is_list() {
+      continue;
+    }
+    if node.item_count().ok()? != 2 {
+      continue;
+    }
+
+    let value_item = node.at(1).ok()?;
+
+    // In trie leaf nodes this value is usually encoded as bytes containing
+    // the account RLP list. Handle both "bytes of RLP list" and direct list.
+    let account_rlp = if value_item.is_list() {
+      value_item
+    } else {
+      let raw = value_item.data().ok()?;
+      rlp::Rlp::new(raw)
+    };
+
+    if !account_rlp.is_list() || account_rlp.item_count().ok()? != 4 {
+      continue;
+    }
+
+    let storage_root_raw = account_rlp.at(2).ok()?.data().ok()?;
+    if storage_root_raw.len() != 32 {
+      continue;
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(storage_root_raw);
+    return Some(B256(arr));
+  }
+  None
+}
+
 /// Check response contains all requested keys in `storageProof` and validate
-/// each proof with the proof validator (currently a stub returning true).
+/// account/storage proof node vectors with a structural proof validator.
 pub fn is_valid_response_for_keys(rpc: &RpcResponse, keys: &[B256]) -> bool {
   let result_val = match rpc.result.as_ref() {
     Some(r) => r,
@@ -120,6 +184,34 @@ pub fn is_valid_response_for_keys(rpc: &RpcResponse, keys: &[B256]) -> bool {
     Some(o) => o,
     None => return false,
   };
+
+  let account_proof_arr = match result_obj.get("accountProof").and_then(|v| v.as_array()) {
+    Some(arr) => arr,
+    None => return false,
+  };
+  let account_proof_strings: Vec<String> =
+    account_proof_arr.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect();
+  if account_proof_strings.len() != account_proof_arr.len() {
+    return false;
+  }
+  if !validate_proof_nodes(&account_proof_strings) {
+    return false;
+  }
+  let storage_hash = match result_obj.get("storageHash").and_then(|v| v.as_str()) {
+    Some(v) => v,
+    None => return false,
+  };
+  let expected_storage_root = B256::from_hex(storage_hash);
+  if !expected_storage_root.is_some() {
+    return false;
+  }
+  let proof_storage_root = match extract_account_storage_root(&account_proof_strings) {
+    Some(v) => v,
+    None => return false,
+  };
+  if expected_storage_root.unwrap_or_default() != proof_storage_root {
+    return false;
+  }
 
   let storage_proofs = match result_obj.get("storageProof").and_then(|v| v.as_array()) {
     Some(arr) => arr,
@@ -146,7 +238,7 @@ pub fn is_valid_response_for_keys(rpc: &RpcResponse, keys: &[B256]) -> bool {
           if proof_strings.len() != proof_arr.len() {
             return false;
           } // non-string element
-          if !validate_proof_dummy(&proof_strings) {
+          if !validate_proof_nodes(&proof_strings) {
             return false;
           }
           found = true;
@@ -227,6 +319,7 @@ async fn integration_rpc_eth_insert_getproof() {
   assert!(status.is_success());
   println!("eth_getProof response body: {}", body);
   let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(is_valid_response_for_keys(&rpc, &[]));
   let result_val = rpc.result.as_ref().expect("missing result");
   let result_obj = result_val.as_object().expect("result not object");
   let _account_proof = result_obj
@@ -277,6 +370,7 @@ async fn integration_rpc_eth_getproof_by_block_hash_selector() {
   assert!(status.is_success());
 
   let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(is_valid_response_for_keys(&rpc, &[]));
   let result_val = rpc.result.as_ref().expect("missing result");
   let result_obj = result_val.as_object().expect("result not object");
   let _account_proof = result_obj
@@ -350,6 +444,7 @@ async fn integration_rpc_eth_getproof_with_storage_key() {
   // Parse and validate: if storageProof is present ensure it's well-formed;
   // presence of the exact requested key is optional for this PoC.
   let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(is_valid_response_for_keys(&rpc, &[key]));
   let result_val = rpc.result.as_ref().expect("missing result");
   let result = result_val.as_object().expect("result not object");
 
