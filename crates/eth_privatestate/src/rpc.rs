@@ -75,6 +75,10 @@ fn invalid_hex_error(field: &str) -> ErrorObjectOwned {
   ErrorObjectOwned::owned(-32602, format!("Failed to decode {} hex", field), None::<()>)
 }
 
+fn unsupported_error(message: &str) -> ErrorObjectOwned {
+  ErrorObjectOwned::owned(-32602, message.to_string(), None::<()>)
+}
+
 fn data_non_availability_error() -> ErrorObjectOwned {
   ErrorObjectOwned::owned(-32001, "Failed due to data non availability".to_string(), None::<()>)
 }
@@ -196,6 +200,9 @@ pub async fn eth_get_proof_handler(
   let root_opt = match block_selector {
     BlockSelector::Number(block_num) => state.get_root(block_num).await,
     BlockSelector::BlockHash(selector) => {
+      if selector.require_canonical == Some(true) {
+        return Err(unsupported_error("requireCanonical=true is unsupported"));
+      }
       let block_hash = decode_b256_hex(&selector.block_hash, "block hash")?;
       state.get_root_by_hash(block_hash).await
     }
@@ -317,6 +324,24 @@ mod tests {
     let err = res.err().unwrap();
     assert_eq!(err.code(), -32602);
     assert!(err.message().contains("Failed to decode storage key hex"));
+  }
+
+  #[tokio::test]
+  async fn test_require_canonical_true_is_unsupported() {
+    let state = Arc::new(SharedState::new(1 << 10));
+    let params = GetProofParams(
+      "0x0000000000000000000000000000000000000000".to_string(),
+      vec![],
+      BlockSelector::BlockHash(BlockHashSelector {
+        block_hash: B256::zero().to_hex(),
+        require_canonical: Some(true),
+      }),
+    );
+    let res = eth_get_proof_handler(params, state).await;
+    assert!(res.is_err());
+    let err = res.err().unwrap();
+    assert_eq!(err.code(), -32602);
+    assert!(err.message().contains("requireCanonical=true is unsupported"));
   }
 
   #[tokio::test]

@@ -287,6 +287,21 @@ async fn integration_rpc_eth_getproof_by_block_hash_selector() {
 }
 
 #[tokio::test]
+async fn integration_rpc_eth_getproof_block_hash_require_canonical_unsupported() {
+  let (srv, _state) = TestServer::start(1 << 10).await;
+  let addr_hex = String::from("0xdAC17F958D2ee523a2206206994597C13D831ec7");
+  let params =
+    json!([addr_hex, [], {"blockHash": B256::zero().to_hex(), "requireCanonical": true}]);
+  let (status, body) = send_rpc_request(&srv.url, "eth_getProof", params, 331).await;
+  assert!(status.is_success());
+
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  let err = rpc.error.expect("expected rpc error");
+  assert_eq!(err.code, -32602);
+  assert!(err.message.contains("requireCanonical=true is unsupported"));
+}
+
+#[tokio::test]
 async fn integration_rpc_eth_getproof_with_storage_key() {
   let (srv, _state) = TestServer::start(1 << 10).await;
 
