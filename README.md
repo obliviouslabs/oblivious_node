@@ -20,7 +20,7 @@
 ## Usage
 - RPC endpoints: `eth_getProof`, `admin_put_node`, `admin_set_root`.
 - Example (single-line):
-  `curl -s -X POST http://127.0.0.1:8545 -H 'Content-Type: application/json' --data '{"jsonrpc":"2.0","method":"eth_getProof","params":["0xdAC17F958D2ee523a2206206994597C13D831ec7", ["0x0"], "latest"],"id":1}'`
+  `curl -s -X POST http://127.0.0.1:8545 -H 'Content-Type: application/json' --data '{"jsonrpc":"2.0","method":"eth_getProof","params":["0xdAC17F958D2ee523a2206206994597C13D831ec7", ["0x0"], 1],"id":1}'`
 
 ## Design notes
 - Goal: make instruction and memory access patterns independent of clients' private inputs so proofs can be generated in constant time and with reduced leakage inside of TEEs.

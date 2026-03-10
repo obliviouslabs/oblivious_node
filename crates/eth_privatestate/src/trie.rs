@@ -50,7 +50,8 @@ pub async fn generate_proof<const ADDR_LEN: usize>(
       r
     };
 
-    // UNDONE(): Discuss how to handle missing nodes.
+    // Missing nodes are treated as data non-availability for the requested root.
+    // We fail fast here and map this to `ProofError::MissingNode`.
     if enabled & (ob_node.rlp_length == 0) {
       return Err(ProofError::MissingNode);
     }

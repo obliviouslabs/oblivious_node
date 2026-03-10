@@ -408,9 +408,10 @@ impl ObliviousNode {
     serde_json::value::RawValue::from_string(s).expect("valid raw json value")
   }
 
+  /// Computes the canonical trie hash over `rlp_encoded[..rlp_length]`.
+  /// Leaks: `rlp_length` (slice/update length).
   pub fn keccak_hash(&self) -> B256 {
     let mut hasher = Keccak256::new();
-    // UNDONE(): do not leak rlp_length?
     hasher.update(&self.rlp_encoded[..self.rlp_length]);
     let result = hasher.finalize();
     let mut hash_bytes = [0u8; 32];

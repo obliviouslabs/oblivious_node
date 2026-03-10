@@ -23,7 +23,10 @@ pub struct BlockHashSelector {
 #[derive(Clone, Deserialize, Debug)]
 #[serde(untagged)]
 pub enum BlockSelector {
+  /// Block number selector (e.g. `1`).
   Number(u64),
+  /// Block hash selector object (e.g. `{"blockHash":"0x...", "requireCanonical": false}`).
+  /// UNDONE(): Named tags like `"latest"` are currently unsupported.
   BlockHash(BlockHashSelector),
 }
 
@@ -240,6 +243,7 @@ pub async fn eth_get_proof_handler(
     .await
     .map_err(map_proof_error)?;
     let proof_rv = RawValue::from_string(ret_proof).map_err(serialization_error)?;
+
     let value_rv = trie::parse_value(ret_value.as_slice());
     let value_rv = RawValue::from_string(value_rv).map_err(serialization_error)?;
     storage_proofs.push(StorageProofBoxed { key: key_hex, value: value_rv, proof: proof_rv });
