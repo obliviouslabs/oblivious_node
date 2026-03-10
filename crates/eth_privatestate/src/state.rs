@@ -58,3 +58,34 @@ impl SharedState {
     }
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn test_set_and_get_root_by_number() {
+    let state = SharedState::new(1 << 10);
+    let root =
+      B256::from_hex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap();
+
+    state.set_root(100, root).await;
+
+    assert_eq!(state.get_root(100).await, Some(root));
+    assert_eq!(state.get_root(101).await, None);
+  }
+
+  #[tokio::test]
+  async fn test_set_and_get_root_by_hash() {
+    let state = SharedState::new(1 << 10);
+    let block_hash =
+      B256::from_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+    let root =
+      B256::from_hex("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+
+    state.set_root_by_hash(block_hash, root).await;
+
+    assert_eq!(state.get_root_by_hash(block_hash).await, Some(root));
+    assert_eq!(state.get_root_by_hash(B256([0x11; 32])).await, None);
+  }
+}

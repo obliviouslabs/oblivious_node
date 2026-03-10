@@ -69,6 +69,17 @@ fn parse_rpc_response(body: &str) -> Result<RpcResponse, String> {
   Ok(RpcResponse { raw: v, result, error })
 }
 
+fn assert_rpc_error(rpc: &RpcResponse, expected_code: i64, message_contains: &str) {
+  let err = rpc.error.as_ref().expect("expected error object");
+  assert_eq!(err.code, expected_code);
+  assert!(
+    err.message.contains(message_contains),
+    "error message '{}' did not contain '{}'",
+    err.message,
+    message_contains
+  );
+}
+
 /// Send a JSON-RPC request to `url` with given `method`, `params` and `id`.
 /// Returns (status, body) where body is a string of the response payload.
 async fn send_rpc_request(
@@ -390,9 +401,49 @@ async fn integration_rpc_eth_getproof_block_hash_require_canonical_unsupported()
   assert!(status.is_success());
 
   let rpc = parse_rpc_response(&body).expect("invalid RPC response");
-  let err = rpc.error.expect("expected rpc error");
-  assert_eq!(err.code, -32602);
-  assert!(err.message.contains("requireCanonical=true is unsupported"));
+  assert_rpc_error(&rpc, -32602, "requireCanonical=true is unsupported");
+}
+
+#[tokio::test]
+async fn integration_rpc_eth_getproof_selector_error_matrix() {
+  let (srv, _state) = TestServer::start(1 << 10).await;
+  let addr_hex = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
+
+  let cases = vec![
+    (json!("latest"), -32602, "Invalid params"),
+    (json!({}), -32602, "Invalid params"),
+    (json!({"blockHash": 123}), -32602, "Invalid params"),
+    (json!({"blockHash": "0x1234"}), -32602, "Failed to decode block hash hex"),
+    (json!({"blockHash": B256([0x44; 32]).to_hex()}), -32001, "data non availability"),
+  ];
+
+  for (idx, (selector, expected_code, expected_message)) in cases.into_iter().enumerate() {
+    let params = json!([addr_hex, [], selector]);
+    let (status, body) =
+      send_rpc_request(&srv.url, "eth_getProof", params, 370 + (idx as u64)).await;
+    assert!(status.is_success());
+    let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+    assert_rpc_error(&rpc, expected_code, expected_message);
+  }
+}
+
+#[tokio::test]
+async fn integration_rpc_admin_put_node_invalid_input_matrix() {
+  let (srv, _state) = TestServer::start(1 << 10).await;
+
+  let cases = vec![
+    (json!("0xzz"), -32602, "Failed to decode node hex"),
+    (json!("0xc0"), -32602, "Failed to parse node RLP into ObliviousNode"),
+    (json!("0x01"), -32602, "Failed to parse node RLP into ObliviousNode"),
+  ];
+
+  for (idx, (node_hex, expected_code, expected_message)) in cases.into_iter().enumerate() {
+    let (status, body) =
+      send_rpc_request(&srv.url, "admin_put_node", node_hex, 390 + (idx as u64)).await;
+    assert!(status.is_success());
+    let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+    assert_rpc_error(&rpc, expected_code, expected_message);
+  }
 }
 
 #[tokio::test]
