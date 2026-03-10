@@ -347,12 +347,23 @@ async fn integration_rpc_eth_getproof_with_storage_key() {
 
   if let Some(storage_proofs) = result.get("storageProof") {
     if let Some(arr) = storage_proofs.as_array() {
+      let mut found_expected_key = false;
       for entry in arr.iter() {
         let entry_obj = entry.as_object().expect("storageProof entry not object");
         // basic shape checks
         assert!(entry_obj.get("key").is_some());
+        assert!(entry_obj.get("value").is_some());
         assert!(entry_obj.get("proof").is_some());
+        if entry_obj.get("key").and_then(|v| v.as_str()) == Some(&key.to_hex()) {
+          found_expected_key = true;
+          let v = entry_obj.get("value").and_then(|v| v.as_str()).expect("value not string");
+          assert_eq!(
+            v, "0x94c6cde7c39eb2f0f0095f41570af89efc2c1ea828",
+            "storage value should match decoded payload bytes"
+          );
+        }
       }
+      assert!(found_expected_key, "missing storageProof entry for requested key");
     }
   }
 }

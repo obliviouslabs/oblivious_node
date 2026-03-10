@@ -115,12 +115,14 @@ pub fn parse_account(rlp_bytes: &[u8]) -> (String, String, B256, B256) {
   )
 }
 
+/// Parse the RLP payload at offset 0 into a fixed-size quoted hex token.
+/// Output format is `"0x..."` with trailing spaces so serialized token length is constant.
+/// Leaks: `rlp_bytes.len()`.
 pub fn parse_value(rlp_bytes: &[u8]) -> String {
   let mut rlp_bytes_local = vec![0u8; rlp_bytes.len()];
   let (_tp, size, _start) = ObliviousNode::rlp_decode_type_and_size(rlp_bytes, 0);
   oblivious_memcpy(&mut rlp_bytes_local, rlp_bytes, _start);
-
-  bytes_to_hex_oblivious_hidden_size_quoted(&rlp_bytes_local, size)
+  bytes_to_hex_oblivious_hidden_size_quoted(&rlp_bytes_local, size.min(rlp_bytes_local.len()))
 }
 
 #[cfg(test)]
@@ -411,5 +413,36 @@ mod tests {
     let mut ret_value = [0u8; VALUE_BUF];
     let res = generate_proof::<32>(&storage, root_hash, &key, &mut ret_proof, &mut ret_value).await;
     assert_eq!(res, Err(ProofError::TraversalCapExceeded));
+  }
+
+  #[test]
+  fn test_parse_value() {
+    let cases: Vec<(&str, &str)> = vec![
+      // Empty payload
+      ("80", "\"0x\""),
+      // 2-byte payload
+      ("821234", "\"0x1234\""),
+      // Leading-zero byte should remain visible (no canonical trimming)
+      ("82000f", "\"0x000f\""),
+      // Full 32-byte payload (hardcoded RLP string)
+      (
+        "a0000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "\"0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\"",
+      ),
+    ];
+
+    let mut out_len: Option<usize> = None;
+    for (rlp_hex, expected_visible) in cases {
+      let decoded = hex::decode(rlp_hex).unwrap();
+      let mut encoded = vec![0u8; 40];
+      encoded[..decoded.len()].copy_from_slice(&decoded);
+      let v = parse_value(&encoded);
+      if let Some(n) = out_len {
+        assert_eq!(v.len(), n, "output token length should be constant");
+      } else {
+        out_len = Some(v.len());
+      }
+      assert_eq!(v.trim_end_matches(' '), expected_visible);
+    }
   }
 }
