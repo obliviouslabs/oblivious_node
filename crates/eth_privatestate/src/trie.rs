@@ -132,6 +132,7 @@ mod tests {
   use crate::oblivious_node::ObliviousNode;
   use crate::types::B256;
   use crate::types::H160;
+  use proptest::prelude::*;
   use rlp::RlpStream;
   use rostl_datastructures::map::UnsortedMap;
   use sha3::Digest;
@@ -444,6 +445,57 @@ mod tests {
         out_len = Some(v.len());
       }
       assert_eq!(v.trim_end_matches(' '), expected_visible);
+    }
+  }
+
+  proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn prop_parse_value_fixed_shape_and_len(input in proptest::collection::vec(any::<u8>(), 3..=64)) {
+      let out = parse_value(&input);
+      prop_assert_eq!(out.len(), 3 + (input.len() * 2));
+      prop_assert!(out.starts_with("\"0x"));
+    }
+
+    #[test]
+    fn prop_generate_proof_small_branch_graph_no_panic(
+      target in 0usize..16usize,
+      key_nibble in 0u8..16u8,
+      child_hash in proptest::array::uniform32(any::<u8>()),
+      random_root in proptest::array::uniform32(any::<u8>()),
+      use_existing_root in any::<bool>()
+    ) {
+      let mut s = RlpStream::new_list(17);
+      for i in 0..16 {
+        if i == target {
+          s.append(&child_hash.as_ref());
+        } else {
+          s.append(&"");
+        }
+      }
+      s.append(&"");
+      let out = s.out();
+      let root_node = ObliviousNode::from_rlp(&out).expect("constructed branch should parse");
+      let root_hash = root_node.keccak_hash();
+
+      let storage = Arc::new(Mutex::new(UnsortedMap::<B256, ObliviousNode>::new(1 << 6)));
+      let selected_root = if use_existing_root { root_hash } else { B256(random_root) };
+      let key = [key_nibble];
+
+      let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+      let res = rt.block_on(async {
+        {
+          let mut guard = storage.lock().await;
+          guard.insert(root_hash, root_node);
+        }
+
+        let mut ret_proof = String::new();
+        let mut ret_value = [0u8; VALUE_BUF];
+        generate_proof::<1>(&storage, selected_root, &key, &mut ret_proof, &mut ret_value).await
+      });
+
+      prop_assert!(matches!(res, Ok(()) | Err(ProofError::MissingNode)));
     }
   }
 }

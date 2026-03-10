@@ -323,8 +323,12 @@ impl ObliviousNode {
   }
 
   /// Turns a node in rlp to an ObliviousNode, leaks `node_rlp` node type and contents.
+  /// Fails if the node_rlp is larger than NODE_BUF or if the RLP is invalid or not a list of length 2 or 17.
   pub fn from_rlp(node_rlp: &[u8]) -> Option<Self> {
     use rlp::Rlp;
+    if node_rlp.len() > NODE_BUF {
+      return None;
+    }
     let r = Rlp::new(node_rlp);
     let mut ob = ObliviousNode::zeroed();
     ob.rlp_encoded[..node_rlp.len()].copy_from_slice(node_rlp);
@@ -424,6 +428,7 @@ impl ObliviousNode {
 #[allow(clippy::needless_range_loop)]
 mod tests {
   use super::*;
+  use proptest::prelude::*;
 
   #[test]
   fn test_rlp_decode_type_and_size() {
@@ -787,6 +792,76 @@ mod tests {
     // remainder inside quotes should be spaces
     for i in (1 + visible_len)..(1 + inner_len) {
       assert_eq!(s.as_bytes()[i], b' ', "expected padding space at pos {}", i);
+    }
+  }
+
+  proptest! {
+    #![proptest_config(ProptestConfig::with_cases(96))]
+
+    #[test]
+    fn prop_from_rlp_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..(4*NODE_BUF))) {
+      let res = std::panic::catch_unwind(|| ObliviousNode::from_rlp(&bytes));
+      prop_assert!(res.is_ok());
+    }
+
+    #[test]
+    fn prop_from_rlp_roundtrip_invariants(bytes in proptest::collection::vec(any::<u8>(), 0..=NODE_BUF)) {
+      if let Some(node) = ObliviousNode::from_rlp(&bytes) {
+        let (padded, len) = node.to_rlp_padded();
+        prop_assert_eq!(len, bytes.len());
+        prop_assert_eq!(&padded[..len], bytes.as_slice());
+      }
+    }
+
+    #[test]
+    fn prop_traverse_terminal_state_no_panic(
+      bytes in proptest::collection::vec(any::<u8>(), 0..=NODE_BUF),
+      key in proptest::collection::vec(0u8..16u8, 64)
+    ) {
+      if let Some(node) = ObliviousNode::from_rlp(&bytes) {
+        let mut addr = [0u8; 64];
+        addr.copy_from_slice(&key);
+        let mut idx = 65usize; // traversal disabled
+        let mut out = [0u8; VALUE_BUF];
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+          node.traverse_oblivious::<64>(&addr, &mut idx, &mut out);
+        }));
+        prop_assert!(res.is_ok());
+        prop_assert_eq!(idx, 65usize);
+      }
+    }
+
+    #[test]
+    fn prop_traverse_branch_hash_child_is_safe(
+      target in 0usize..16usize,
+      key_nibble in 0u8..16u8,
+      child_hash in proptest::array::uniform32(any::<u8>())
+    ) {
+      let mut s = rlp::RlpStream::new_list(17);
+      for i in 0..16 {
+        if i == target {
+          s.append(&child_hash.as_ref());
+        } else {
+          s.append(&"");
+        }
+      }
+      s.append(&"");
+      let out = s.out();
+      let node = ObliviousNode::from_rlp(&out).expect("constructed branch should parse");
+
+      let mut key = [0u8; 1];
+      key[0] = key_nibble;
+      let mut idx = 0usize;
+      let mut ret = [0u8; VALUE_BUF];
+      node.traverse_oblivious::<1>(&key, &mut idx, &mut ret);
+
+      if (key_nibble as usize) == target {
+        prop_assert_eq!(idx, 1usize);
+        prop_assert_eq!(ret[0], 0xa0);
+        prop_assert_eq!(&ret[1..33], &child_hash);
+      } else {
+        prop_assert_eq!(idx, IDX_NONMEMBER);
+      }
     }
   }
 }

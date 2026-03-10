@@ -33,4 +33,4 @@ env_logger.workspace = true
 [dev-dependencies]
 reqwest.workspace = true
 bytes.workspace = true
-
+proptest.workspace = true
