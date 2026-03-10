@@ -95,7 +95,7 @@ async fn send_eth_get_proof(
   url: &str,
   address: &H160,
   keys: &[B256],
-  block: u64,
+  block: JsonValue,
   id: u64,
 ) -> (reqwest::StatusCode, String) {
   let keys_json: Vec<String> = keys.iter().map(|k| k.to_hex()).collect();
@@ -215,7 +215,7 @@ async fn integration_rpc_eth_insert_getproof() {
     assert!(status.is_success());
   }
   // set the root to the first account node for block 1
-  let root_hex = format!("0x{}", first_hh.to_hex());
+  let root_hex = first_hh.to_hex();
   let (status, _body) =
     send_rpc_request(&srv.url, "admin_set_root", json!([1, root_hex]), 12).await;
   assert!(status.is_success());
@@ -235,6 +235,55 @@ async fn integration_rpc_eth_insert_getproof() {
     .as_array()
     .expect("accountProof not array");
   // presence is sufficient for this test (PoC)
+}
+
+#[tokio::test]
+async fn integration_rpc_eth_getproof_by_block_hash_selector() {
+  let (srv, _state) = TestServer::start(1 << 10).await;
+
+  let mut first_hh = B256::zero();
+  for node in ACCOUNT_NODES.iter() {
+    let node_bytes = hex::decode(node).unwrap();
+    let ob = ObliviousNode::from_rlp(&node_bytes).unwrap();
+    let hh = ob.keccak_hash();
+    if first_hh == B256::zero() {
+      first_hh = hh;
+    }
+    let (status, _body) =
+      send_rpc_request(&srv.url, "admin_put_node", json!(format!("0x{}", node)), 30).await;
+    assert!(status.is_success());
+  }
+  for node in PROOF_NODES.iter() {
+    let (status, _body) =
+      send_rpc_request(&srv.url, "admin_put_node", json!(format!("0x{}", node)), 31).await;
+    assert!(status.is_success());
+  }
+
+  let root_hex = first_hh.to_hex();
+  let block_hash = B256([0x11u8; 32]);
+  let block_hash_hex = block_hash.to_hex();
+  let (status, _body) = send_rpc_request(
+    &srv.url,
+    "admin_set_root_by_hash",
+    json!([block_hash_hex.clone(), root_hex]),
+    32,
+  )
+  .await;
+  assert!(status.is_success());
+
+  let addr_hex = String::from("0xdAC17F958D2ee523a2206206994597C13D831ec7");
+  let params = json!([addr_hex, [], {"blockHash": block_hash_hex}]);
+  let (status, body) = send_rpc_request(&srv.url, "eth_getProof", params, 33).await;
+  assert!(status.is_success());
+
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  let result_val = rpc.result.as_ref().expect("missing result");
+  let result_obj = result_val.as_object().expect("result not object");
+  let _account_proof = result_obj
+    .get("accountProof")
+    .expect("missing accountProof")
+    .as_array()
+    .expect("accountProof not array");
 }
 
 #[tokio::test]
@@ -269,7 +318,7 @@ async fn integration_rpc_eth_getproof_with_storage_key() {
       send_rpc_request(&srv.url, "admin_put_node", json!(format!("0x{}", node)), 21).await;
     assert!(status.is_success());
   }
-  let root_hex = format!("0x{}", first_hh.to_hex());
+  let root_hex = first_hh.to_hex();
   let (status, _body) =
     send_rpc_request(&srv.url, "admin_set_root", json!([1, root_hex]), 22).await;
   assert!(status.is_success());
@@ -278,7 +327,7 @@ async fn integration_rpc_eth_getproof_with_storage_key() {
   let addr_hex = String::from("0xdAC17F958D2ee523a2206206994597C13D831ec7");
   let addr = H160::from_hex(&addr_hex).unwrap();
   let key = B256::zero();
-  let (status, body) = send_eth_get_proof(&srv.url, &addr, &[key], 1, 23).await;
+  let (status, body) = send_eth_get_proof(&srv.url, &addr, &[key], json!(1), 23).await;
 
   // srv will be stopped when dropped at test end
   assert!(status.is_success());

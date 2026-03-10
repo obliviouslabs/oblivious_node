@@ -12,9 +12,24 @@ use crate::state::SharedState;
 use crate::trie::{self, parse_account};
 use crate::types::{B256, H160};
 
-/// RPC params for `eth_getProof`: (address, storage_keys, block_number)
+#[derive(Clone, Deserialize, Debug)]
+pub struct BlockHashSelector {
+  #[serde(rename = "blockHash")]
+  pub block_hash: String,
+  #[serde(default, rename = "requireCanonical")]
+  pub require_canonical: Option<bool>,
+}
+
+#[derive(Clone, Deserialize, Debug)]
+#[serde(untagged)]
+pub enum BlockSelector {
+  Number(u64),
+  BlockHash(BlockHashSelector),
+}
+
+/// RPC params for `eth_getProof`: (address, storage_keys, block_selector)
 #[derive(Deserialize, Debug)]
-pub struct GetProofParams(pub String, pub Vec<String>, pub u64);
+pub struct GetProofParams(pub String, pub Vec<String>, pub BlockSelector);
 
 #[derive(Clone, Serialize, Debug)]
 pub struct StorageProofBoxed {
@@ -102,20 +117,46 @@ pub fn register_rpc(state: Arc<SharedState>) -> anyhow::Result<RpcModule<Arc<Sha
       let (block_num, root_hex): (u64, String) = paramst
         .parse()
         .map_err(|_| ErrorObjectOwned::owned(-32602, "Invalid params".to_string(), None::<()>))?;
-      let root_bytes = hex::decode(root_hex.trim_start_matches("0x")).map_err(|_| {
-        ErrorObjectOwned::owned(-32602, "Failed to decode root hex".to_string(), None::<()>)
-      })?;
-      if root_bytes.len() != 32 {
+      let root = B256::from_hex(&root_hex);
+      if !root.is_some() {
         return Err(ErrorObjectOwned::owned(
           -32602,
-          "Root bytes length invalid".to_string(),
+          "Failed to decode root hex".to_string(),
           None::<()>,
         ));
       }
-      let mut root_arr = [0u8; 32];
-      root_arr.copy_from_slice(&root_bytes);
-      let root_b256 = B256(root_arr);
+      let root_b256 = root.unwrap_or_default();
       state.set_root(block_num, root_b256).await;
+      Ok::<_, ErrorObjectOwned>(true)
+    }
+  })?;
+
+  module.register_async_method("admin_set_root_by_hash", move |paramst, ctx, _| {
+    let state = ctx.as_ref().clone();
+    async move {
+      let (block_hash_hex, root_hex): (String, String) = paramst
+        .parse()
+        .map_err(|_| ErrorObjectOwned::owned(-32602, "Invalid params".to_string(), None::<()>))?;
+      let block_hash = B256::from_hex(&block_hash_hex);
+      if !block_hash.is_some() {
+        return Err(ErrorObjectOwned::owned(
+          -32602,
+          "Failed to decode block hash hex".to_string(),
+          None::<()>,
+        ));
+      }
+      let block_hash = block_hash.unwrap_or_default();
+
+      let root = B256::from_hex(&root_hex);
+      if !root.is_some() {
+        return Err(ErrorObjectOwned::owned(
+          -32602,
+          "Failed to decode root hex".to_string(),
+          None::<()>,
+        ));
+      }
+      let root_b256 = root.unwrap_or_default();
+      state.set_root_by_hash(block_hash, root_b256).await;
       Ok::<_, ErrorObjectOwned>(true)
     }
   })?;
@@ -127,7 +168,7 @@ pub async fn eth_get_proof_handler(
   params: GetProofParams,
   state: Arc<SharedState>,
 ) -> Result<EthGetProofResultBoxed, ErrorObjectOwned> {
-  let GetProofParams(address_hex, storage_keys, block_num) = params;
+  let GetProofParams(address_hex, storage_keys, block_selector) = params;
 
   // parse address
   // UNDONE(): this should not be unwrap.
@@ -136,8 +177,22 @@ pub async fn eth_get_proof_handler(
   println!("Arrayed: {:x?}", address);
   println!("Storage keys: {:?}", storage_keys);
 
-  // get root for the requested block
-  let root_opt = state.get_root(block_num).await;
+  // get root for the requested block selector
+  let root_opt = match block_selector {
+    BlockSelector::Number(block_num) => state.get_root(block_num).await,
+    BlockSelector::BlockHash(selector) => {
+      let block_hash = B256::from_hex(&selector.block_hash);
+      if !block_hash.is_some() {
+        return Err(ErrorObjectOwned::owned(
+          -32602,
+          "Failed to decode block hash hex".to_string(),
+          None::<()>,
+        ));
+      }
+      let block_hash = block_hash.unwrap_or_default();
+      state.get_root_by_hash(block_hash).await
+    }
+  };
   if root_opt.is_none() {
     return Err(ErrorObjectOwned::owned(
       -32001,
@@ -258,8 +313,11 @@ mod tests {
   #[tokio::test]
   async fn test_missing_root_returns_error() {
     let state = Arc::new(SharedState::new(1 << 10));
-    let params =
-      GetProofParams("0x0000000000000000000000000000000000000000".to_string(), vec![], 42);
+    let params = GetProofParams(
+      "0x0000000000000000000000000000000000000000".to_string(),
+      vec![],
+      BlockSelector::Number(42),
+    );
     let res = eth_get_proof_handler(params, state).await;
     assert!(res.is_err());
     let err = res.err().unwrap();
@@ -294,6 +352,22 @@ mod tests {
     let retrieved_root = retrieved_root_opt.unwrap();
     let expected_root = B256::from_hex(root_hex).unwrap();
     assert_eq!(retrieved_root, expected_root);
+  }
+
+  #[tokio::test]
+  async fn test_admin_set_root_by_hash() {
+    let state = Arc::new(SharedState::new(1 << 10));
+    let block_hash_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let root_hex = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let block_hash = B256::from_hex(block_hash_hex).unwrap();
+    let root = B256::from_hex(root_hex).unwrap();
+
+    state.set_root_by_hash(block_hash, root).await;
+
+    let retrieved_root_opt = state.get_root_by_hash(block_hash).await;
+    assert!(retrieved_root_opt.is_some());
+    let retrieved_root = retrieved_root_opt.unwrap();
+    assert_eq!(retrieved_root, root);
   }
 
   #[tokio::test]
@@ -345,7 +419,7 @@ mod tests {
     println!("First hh: {:?}", first_hh.to_hex());
     state.set_root(1, first_hh).await;
     let addr_hex = String::from("0xdAC17F958D2ee523a2206206994597C13D831ec7");
-    let params = GetProofParams(addr_hex, vec![B256::zero().to_hex()], 1);
+    let params = GetProofParams(addr_hex, vec![B256::zero().to_hex()], BlockSelector::Number(1));
     let res = eth_get_proof_handler(params, state.clone()).await;
     assert!(res.is_ok());
     let ok = res.unwrap();
