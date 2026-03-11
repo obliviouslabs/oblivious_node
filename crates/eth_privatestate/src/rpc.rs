@@ -3,12 +3,12 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use jsonrpsee::server::{RpcModule, ServerBuilder};
+use jsonrpsee::server::RpcModule;
 use jsonrpsee::types::error::ErrorObjectOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-use crate::oblivious_node::{ObliviousNode, VALUE_BUF};
+use crate::oblivious_node::VALUE_BUF;
 use crate::state::SharedState;
 use crate::trie::{self, parse_account, ProofError};
 use crate::types::{B256, H160};
@@ -84,6 +84,10 @@ fn unsupported_error(message: &str) -> ErrorObjectOwned {
   ErrorObjectOwned::owned(-32602, message.to_string(), None::<()>)
 }
 
+pub(crate) fn invalid_params_error() -> ErrorObjectOwned {
+  ErrorObjectOwned::owned(-32602, "Invalid params".to_string(), None::<()>)
+}
+
 fn data_non_availability_error() -> ErrorObjectOwned {
   ErrorObjectOwned::owned(-32001, "Failed due to data non availability".to_string(), None::<()>)
 }
@@ -103,7 +107,7 @@ fn serialization_error<E: std::fmt::Display>(err: E) -> ErrorObjectOwned {
   ErrorObjectOwned::owned(-32603, format!("Serialization error: {}", err), None::<()>)
 }
 
-async fn observe_rpc_result<T>(
+pub(crate) async fn observe_rpc_result<T>(
   state: &SharedState,
   method: &'static str,
   started: Instant,
@@ -126,7 +130,7 @@ async fn observe_rpc_result<T>(
   );
 }
 
-fn decode_b256_hex(value: &str, field: &str) -> Result<B256, ErrorObjectOwned> {
+pub(crate) fn decode_b256_hex(value: &str, field: &str) -> Result<B256, ErrorObjectOwned> {
   let parsed = B256::from_hex(value);
   if !parsed.is_some() {
     return Err(invalid_hex_error(field));
@@ -162,8 +166,8 @@ async fn resolve_root_for_selector(
   }
 }
 
-/// Register all RPC methods onto a new `RpcModule` using the provided `state`.
-pub fn register_rpc(state: Arc<SharedState>) -> anyhow::Result<RpcModule<Arc<SharedState>>> {
+/// Register public RPC methods (`eth_*`) onto a new module.
+pub fn register_public_rpc(state: Arc<SharedState>) -> anyhow::Result<RpcModule<Arc<SharedState>>> {
   let mut module = RpcModule::new(state.clone());
 
   module.register_async_method("eth_getProof", move |params, ctx, _| {
@@ -172,93 +176,20 @@ pub fn register_rpc(state: Arc<SharedState>) -> anyhow::Result<RpcModule<Arc<Sha
       let started = Instant::now();
       let res = match params.parse::<GetProofParams>() {
         Ok(p) => eth_get_proof_handler(p, state.clone()).await,
-        Err(_) => Err(ErrorObjectOwned::owned(-32602, "Invalid params".to_string(), None::<()>)),
+        Err(_) => Err(invalid_params_error()),
       };
       observe_rpc_result(state.as_ref(), "eth_getProof", started, &res).await;
       res
     }
   })?;
 
-  // Administrative helper to put a raw node and set it as the root for a block.
-  // Params: (block_number: u64, node_rlp_hex: String)
-  module.register_async_method("admin_put_node", move |params, ctx, _| {
-    let state = ctx.as_ref().clone();
-    async move {
-      let started = Instant::now();
-      let res: Result<bool, ErrorObjectOwned> = async {
-        let node_hex: String = params
-          .parse()
-          .map_err(|_| ErrorObjectOwned::owned(-32602, "Invalid params".to_string(), None::<()>))?;
-        let node_bytes = hex::decode(node_hex.trim_start_matches("0x")).map_err(|_| {
-          ErrorObjectOwned::owned(-32602, "Failed to decode node hex".to_string(), None::<()>)
-        })?;
-        // Parse RLP into ObliviousNode and insert into in-memory storage
-        let ob = ObliviousNode::from_rlp(&node_bytes).ok_or(ErrorObjectOwned::owned(
-          -32602,
-          "Failed to parse node RLP into ObliviousNode".to_string(),
-          None::<()>,
-        ))?;
-        let hh = ob.keccak_hash();
-        {
-          let mut guard = state.storage.lock().await;
-          guard.insert(hh, ob);
-        }
-        Ok::<_, ErrorObjectOwned>(true)
-      }
-      .await;
-      observe_rpc_result(state.as_ref(), "admin_put_node", started, &res).await;
-      res
-    }
-  })?;
+  Ok(module)
+}
 
-  module.register_async_method("admin_set_root", move |paramst, ctx, _| {
-    let state = ctx.as_ref().clone();
-    async move {
-      let started = Instant::now();
-      let res: Result<bool, ErrorObjectOwned> = async {
-        let (block_num, root_hex): (u64, String) = paramst
-          .parse()
-          .map_err(|_| ErrorObjectOwned::owned(-32602, "Invalid params".to_string(), None::<()>))?;
-        let root_b256 = decode_b256_hex(&root_hex, "root")?;
-        state.set_root(block_num, root_b256).await;
-        Ok::<_, ErrorObjectOwned>(true)
-      }
-      .await;
-      observe_rpc_result(state.as_ref(), "admin_set_root", started, &res).await;
-      res
-    }
-  })?;
-
-  module.register_async_method("admin_set_root_by_hash", move |paramst, ctx, _| {
-    let state = ctx.as_ref().clone();
-    async move {
-      let started = Instant::now();
-      let res: Result<bool, ErrorObjectOwned> = async {
-        let (block_hash_hex, root_hex): (String, String) = paramst
-          .parse()
-          .map_err(|_| ErrorObjectOwned::owned(-32602, "Invalid params".to_string(), None::<()>))?;
-        let block_hash = decode_b256_hex(&block_hash_hex, "block hash")?;
-        let root_b256 = decode_b256_hex(&root_hex, "root")?;
-        state.set_root_by_hash(block_hash, root_b256).await;
-        Ok::<_, ErrorObjectOwned>(true)
-      }
-      .await;
-      observe_rpc_result(state.as_ref(), "admin_set_root_by_hash", started, &res).await;
-      res
-    }
-  })?;
-
-  module.register_async_method("admin_get_metrics", move |params, ctx, _| {
-    let state = ctx.as_ref().clone();
-    async move {
-      let started = Instant::now();
-      let _ = params;
-      let res: Result<_, ErrorObjectOwned> = Ok(state.metrics_snapshot().await);
-      observe_rpc_result(state.as_ref(), "admin_get_metrics", started, &res).await;
-      res
-    }
-  })?;
-
+/// Register all methods in one module (used by unit/integration tests).
+pub fn register_rpc(state: Arc<SharedState>) -> anyhow::Result<RpcModule<Arc<SharedState>>> {
+  let mut module = register_public_rpc(state.clone())?;
+  module.merge(crate::rpc_admin::register_admin_rpc(state)?)?;
   Ok(module)
 }
 
@@ -332,28 +263,10 @@ pub async fn eth_get_proof_handler(
   Ok(result)
 }
 
-pub async fn start_rpc(state: Arc<SharedState>) -> anyhow::Result<()> {
-  let addr = "127.0.0.1:8545";
-  let server = ServerBuilder::default().build(addr).await?;
-
-  let module = register_rpc(state.clone())?;
-  let local_addr = server.local_addr().ok();
-
-  let handle = server.start(module);
-
-  if let Some(addr) = local_addr {
-    log::info!("Server listening on {}", addr);
-  } else {
-    log::info!("Server started with no local addr available");
-  }
-
-  handle.stopped().await;
-  Ok(())
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::oblivious_node::ObliviousNode;
   use rlp::RlpStream;
   use std::sync::Arc;
 

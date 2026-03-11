@@ -29,6 +29,8 @@ bytemuck.workspace = true
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
+tower.workspace = true
+hyper.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true

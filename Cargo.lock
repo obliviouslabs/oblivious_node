@@ -335,6 +335,7 @@ dependencies = [
  "env_logger",
  "hash-db",
  "hex",
+ "hyper",
  "jsonrpsee",
  "log",
  "memory-db",
@@ -349,6 +350,7 @@ dependencies = [
  "serde_json",
  "sha3",
  "tokio",
+ "tower",
  "trie-db",
 ]
 

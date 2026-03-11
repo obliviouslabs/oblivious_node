@@ -50,6 +50,8 @@ bytemuck = "1.13"
 anyhow = "1.0"
 log = "0.4"
 env_logger = "0.11"
+tower = { version = "0.5", features = ["util"] }
+hyper = "1"
 
 # [workspace.dev-dependencies]
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }

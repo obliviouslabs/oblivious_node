@@ -7,6 +7,7 @@ use rostl_primitives::traits::Cmov;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
+use crate::authentication::{ApiKeyController, ApiKeyError};
 use crate::{oblivious_node::ObliviousNode, types::B256};
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -79,16 +80,22 @@ pub struct SharedState {
   /// block_hash -> state_root
   pub roots_by_hash: Arc<Mutex<UnsortedMap<B256, B256>>>,
   pub metrics: Arc<Mutex<RpcMetrics>>,
+  pub api_keys: Arc<Mutex<ApiKeyController>>,
 }
 
 impl SharedState {
   pub fn new(cap: usize) -> Self {
+    Self::new_with_admin_key(cap, "olabs-admin-dev-key-please-change".to_string())
+  }
+
+  pub fn new_with_admin_key(cap: usize, admin_api_key: String) -> Self {
     Self {
       storage: Arc::new(Mutex::new(UnsortedMap::new(1 << 10))),
       roots_by_number: Arc::new(Mutex::new(UnsortedMap::new(cap))),
       latest_root_by_number: Arc::new(Mutex::new(None)),
       roots_by_hash: Arc::new(Mutex::new(UnsortedMap::new(cap))),
       metrics: Arc::new(Mutex::new(RpcMetrics::default())),
+      api_keys: Arc::new(Mutex::new(ApiKeyController::new(admin_api_key))),
     }
   }
 
@@ -139,6 +146,38 @@ impl SharedState {
 
   pub async fn metrics_snapshot(&self) -> RpcMetrics {
     self.metrics.lock().await.clone()
+  }
+
+  pub async fn create_client_api_key(&self) -> String {
+    self.api_keys.lock().await.create_key()
+  }
+
+  pub async fn add_tokens_to_api_key(&self, key: &str, tokens: u64) -> Result<(), ApiKeyError> {
+    self.api_keys.lock().await.add_tokens(key, tokens)
+  }
+
+  pub async fn set_hourly_limit_for_api_key(
+    &self,
+    key: &str,
+    hourly_limit: u64,
+  ) -> Result<(), ApiKeyError> {
+    self.api_keys.lock().await.set_hourly_limit(key, hourly_limit)
+  }
+
+  pub async fn disable_api_key(&self, key: &str) -> Result<(), ApiKeyError> {
+    self.api_keys.lock().await.disable_key(key)
+  }
+
+  pub async fn delete_api_key(&self, key: &str) -> Result<(), ApiKeyError> {
+    self.api_keys.lock().await.delete_key(key)
+  }
+
+  pub async fn authorize_public_api_key(&self, key: &str) -> Result<(), ApiKeyError> {
+    self.api_keys.lock().await.authorize_public_request(key)
+  }
+
+  pub async fn authorize_admin_api_key(&self, key: &str) -> Result<(), ApiKeyError> {
+    self.api_keys.lock().await.authorize_admin_request(key)
   }
 }
 
@@ -217,5 +256,65 @@ mod tests {
     assert_eq!(m.latency_total_us, 560);
     assert_eq!(m.latency_max_us, 200);
     assert_eq!(m.latency_avg_us, 112);
+  }
+
+  #[tokio::test]
+  async fn test_api_key_controller_create_and_consume_tokens() {
+    let state = SharedState::new_with_admin_key(1 << 10, "olabs-admin-key-test".to_string());
+    let key = state.create_client_api_key().await;
+    assert!(key.starts_with("olabs-api-"));
+    assert!(state.authorize_public_api_key(&key).await.is_err());
+
+    state.add_tokens_to_api_key(&key, 2).await.unwrap();
+    state.set_hourly_limit_for_api_key(&key, 2).await.unwrap();
+
+    assert_eq!(state.authorize_public_api_key(&key).await, Ok(()));
+    assert_eq!(state.authorize_public_api_key(&key).await, Ok(()));
+    assert_eq!(state.authorize_public_api_key(&key).await, Err(ApiKeyError::TokenExhausted));
+  }
+
+  #[tokio::test]
+  async fn test_api_key_controller_requires_admin_for_admin_route() {
+    let state = SharedState::new_with_admin_key(1 << 10, "olabs-admin-key-test".to_string());
+    let key = state.create_client_api_key().await;
+
+    assert_eq!(state.authorize_admin_api_key(&key).await, Err(ApiKeyError::NotAdmin));
+    assert_eq!(state.authorize_admin_api_key("olabs-admin-key-test").await, Ok(()));
+  }
+
+  #[tokio::test]
+  async fn test_admin_api_key_has_no_hourly_limit() {
+    let admin = "olabs-admin-key-test-0000000000000000";
+    let state = SharedState::new_with_admin_key(1 << 10, admin.to_string());
+
+    for _ in 0..16 {
+      assert_eq!(state.authorize_admin_api_key(admin).await, Ok(()));
+    }
+  }
+
+  #[tokio::test]
+  async fn test_api_key_disable_and_delete() {
+    let admin = "olabs-admin-key-test-1111111111111111";
+    let state = SharedState::new_with_admin_key(1 << 10, admin.to_string());
+    let key = state.create_client_api_key().await;
+
+    state.add_tokens_to_api_key(&key, 2).await.unwrap();
+    state.set_hourly_limit_for_api_key(&key, 2).await.unwrap();
+    assert_eq!(state.authorize_public_api_key(&key).await, Ok(()));
+
+    state.disable_api_key(&key).await.unwrap();
+    assert_eq!(state.authorize_public_api_key(&key).await, Err(ApiKeyError::DisabledKey));
+
+    state.delete_api_key(&key).await.unwrap();
+    assert_eq!(state.authorize_public_api_key(&key).await, Err(ApiKeyError::UnknownKey));
+  }
+
+  #[tokio::test]
+  async fn test_admin_key_cannot_be_disabled_or_deleted() {
+    let admin = "olabs-admin-key-test-2222222222222222";
+    let state = SharedState::new_with_admin_key(1 << 10, admin.to_string());
+
+    assert_eq!(state.disable_api_key(admin).await, Err(ApiKeyError::ProtectedAdminKey));
+    assert_eq!(state.delete_api_key(admin).await, Err(ApiKeyError::ProtectedAdminKey));
   }
 }

@@ -15,12 +15,17 @@
 ## Quickstart
 - Build: `cargo build --workspace --release`
 - Tests: `cargo test -p eth_privatestate` (or `cargo nextest run --workspace` for full suite)
-- Run server: `cargo run -p eth_privatestate --release`
+- Run server: `cargo run -p eth_privatestate --release -- --admin-api-key <at-least-32-char-key>`
 
 ## Usage
-- RPC endpoints: `eth_getProof`, `admin_put_node`, `admin_set_root`.
+- Public endpoint path: `http://127.0.0.1:8545/{api_key}/json_rpc`
+- Admin endpoint path: `http://127.0.0.1:8545/{admin_api_key}/admin`
+- Public methods: `eth_getProof`
+- Admin methods: `admin_put_node`, `admin_set_root`, `admin_set_root_by_hash`, `admin_get_metrics`,
+  `admin_create_api_key`, `admin_add_tokens`, `admin_set_hourly_limit`,
+  `admin_disable_api_key`, `admin_delete_api_key`
 - Example (single-line):
-  `curl -s -X POST http://127.0.0.1:8545 -H 'Content-Type: application/json' --data '{"jsonrpc":"2.0","method":"eth_getProof","params":["0xdAC17F958D2ee523a2206206994597C13D831ec7", ["0x0"], 1],"id":1}'`
+  `curl -s -X POST http://127.0.0.1:8545/olabs-api-.../json_rpc -H 'Content-Type: application/json' --data '{"jsonrpc":"2.0","method":"eth_getProof","params":["0xdAC17F958D2ee523a2206206994597C13D831ec7", ["0x0"], 1],"id":1}'`
 
 ## Design notes
 - Goal: make instruction and memory access patterns independent of clients' private inputs so proofs can be generated in constant time and with reduced leakage inside of TEEs.

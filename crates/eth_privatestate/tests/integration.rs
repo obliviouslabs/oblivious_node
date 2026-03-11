@@ -1,6 +1,7 @@
 #![allow(clippy::all)]
 #![allow(missing_docs)]
 
+use eth_privatestate::frontend::start_rpc_server;
 use eth_privatestate::oblivious_node::ObliviousNode;
 use eth_privatestate::rpc::register_rpc;
 use eth_privatestate::state::SharedState;
@@ -286,6 +287,33 @@ impl TestServer {
 impl Drop for TestServer {
   fn drop(&mut self) {
     // Stop the server and ignore any error (AlreadyStopped)
+    let _ = self.handle.stop();
+  }
+}
+
+pub struct RoutedTestServer {
+  pub base_url: String,
+  pub admin_url: String,
+  pub admin_key: String,
+  handle: jsonrpsee::server::ServerHandle,
+}
+
+impl RoutedTestServer {
+  pub async fn start(capacity: usize, admin_key: &str) -> (Self, Arc<SharedState>) {
+    let state = Arc::new(SharedState::new_with_admin_key(capacity, admin_key.to_string()));
+    let (handle, addr) = start_rpc_server(state.clone(), "127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", addr);
+    let admin_url = format!("{}/{}/admin", base_url, admin_key);
+    (Self { base_url, admin_url, admin_key: admin_key.to_string(), handle }, state)
+  }
+
+  pub fn json_url_for_key(&self, key: &str) -> String {
+    format!("{}/{}/json_rpc", self.base_url, key)
+  }
+}
+
+impl Drop for RoutedTestServer {
+  fn drop(&mut self) {
     let _ = self.handle.stop();
   }
 }
@@ -633,4 +661,161 @@ async fn integration_rpc_admin_get_metrics_reports_counters() {
   assert_eq!(latency_count, 3);
   assert!(latency_total_us >= latency_max_us);
   assert_eq!(latency_avg_us, latency_total_us / latency_count);
+}
+
+#[tokio::test]
+async fn integration_routed_rpc_api_key_tokens_and_admin_permissions() {
+  let admin_key = "olabs-admin-00000000000000000000000000000000";
+  let (srv, _state) = RoutedTestServer::start(1 << 10, admin_key).await;
+
+  let (status, body) =
+    send_rpc_request(&srv.admin_url, "admin_create_api_key", json!([]), 3001).await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(rpc.error.is_none(), "admin_create_api_key should succeed");
+  let client_key =
+    rpc.result.as_ref().and_then(|v| v.as_str()).expect("missing API key result").to_string();
+  assert!(client_key.starts_with("olabs-api-"));
+
+  let (status, _) =
+    send_rpc_request(&srv.admin_url, "admin_add_tokens", json!([client_key.clone(), 2]), 3002)
+      .await;
+  assert!(status.is_success());
+  let (status, _) = send_rpc_request(
+    &srv.admin_url,
+    "admin_set_hourly_limit",
+    json!([client_key.clone(), 10]),
+    3003,
+  )
+  .await;
+  assert!(status.is_success());
+
+  let json_url = srv.json_url_for_key(&client_key);
+  for id in [3004u64, 3005u64] {
+    let (status, _) =
+      send_rpc_request(&json_url, "eth_getProof", json!([12345, "x", "y"]), id).await;
+    assert!(status.is_success(), "request {} should pass quota gate", id);
+  }
+
+  let (status, body) =
+    send_rpc_request(&json_url, "eth_getProof", json!([12345, "x", "y"]), 3006).await;
+  assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+  assert!(body.contains("no remaining tokens"));
+
+  let client_admin_url = format!("{}/{}/admin", srv.base_url, client_key);
+  let (status, body) =
+    send_rpc_request(&client_admin_url, "admin_get_metrics", json!([]), 3007).await;
+  assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+  assert!(body.contains("not authorized for admin endpoint"));
+}
+
+#[tokio::test]
+async fn integration_routed_rpc_hourly_limit_enforced() {
+  let admin_key = "olabs-admin-11111111111111111111111111111111";
+  let (srv, _state) = RoutedTestServer::start(1 << 10, admin_key).await;
+
+  let (status, body) =
+    send_rpc_request(&srv.admin_url, "admin_create_api_key", json!([]), 3101).await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  let client_key =
+    rpc.result.as_ref().and_then(|v| v.as_str()).expect("missing API key result").to_string();
+
+  let (status, _) =
+    send_rpc_request(&srv.admin_url, "admin_add_tokens", json!([client_key.clone(), 10]), 3102)
+      .await;
+  assert!(status.is_success());
+  let (status, _) = send_rpc_request(
+    &srv.admin_url,
+    "admin_set_hourly_limit",
+    json!([client_key.clone(), 1]),
+    3103,
+  )
+  .await;
+  assert!(status.is_success());
+
+  let json_url = srv.json_url_for_key(&client_key);
+  let (status, _) =
+    send_rpc_request(&json_url, "eth_getProof", json!([12345, "x", "y"]), 3104).await;
+  assert!(status.is_success());
+
+  let (status, body) =
+    send_rpc_request(&json_url, "eth_getProof", json!([12345, "x", "y"]), 3105).await;
+  assert_eq!(status, reqwest::StatusCode::TOO_MANY_REQUESTS);
+  assert!(body.contains("hourly allowance"));
+}
+
+#[tokio::test]
+async fn integration_routed_rpc_admin_has_no_hourly_limit() {
+  let admin_key = "olabs-admin-22222222222222222222222222222222";
+  let (srv, _state) = RoutedTestServer::start(1 << 10, admin_key).await;
+
+  for id in 3201u64..3217u64 {
+    let (status, body) = send_rpc_request(&srv.admin_url, "admin_get_metrics", json!([]), id).await;
+    assert!(status.is_success(), "admin request {} should pass auth gate", id);
+    let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+    assert!(rpc.error.is_none(), "admin_get_metrics should succeed");
+  }
+}
+
+#[tokio::test]
+async fn integration_routed_rpc_admin_can_disable_and_delete_api_key() {
+  let admin_key = "olabs-admin-33333333333333333333333333333333";
+  let (srv, _state) = RoutedTestServer::start(1 << 10, admin_key).await;
+
+  let (status, body) =
+    send_rpc_request(&srv.admin_url, "admin_create_api_key", json!([]), 3301).await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(rpc.error.is_none(), "admin_create_api_key should succeed");
+  let client_key =
+    rpc.result.as_ref().and_then(|v| v.as_str()).expect("missing API key result").to_string();
+
+  let (status, _) =
+    send_rpc_request(&srv.admin_url, "admin_add_tokens", json!([client_key.clone(), 2]), 3302)
+      .await;
+  assert!(status.is_success());
+  let (status, _) = send_rpc_request(
+    &srv.admin_url,
+    "admin_set_hourly_limit",
+    json!([client_key.clone(), 2]),
+    3303,
+  )
+  .await;
+  assert!(status.is_success());
+
+  let json_url = srv.json_url_for_key(&client_key);
+  let (status, _) =
+    send_rpc_request(&json_url, "eth_getProof", json!([12345, "x", "y"]), 3304).await;
+  assert!(status.is_success());
+
+  let (status, body) =
+    send_rpc_request(&srv.admin_url, "admin_disable_api_key", json!([client_key.clone()]), 3305)
+      .await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(rpc.error.is_none(), "admin_disable_api_key should succeed");
+
+  let (status, body) =
+    send_rpc_request(&json_url, "eth_getProof", json!([12345, "x", "y"]), 3306).await;
+  assert_eq!(status, reqwest::StatusCode::FORBIDDEN);
+  assert!(body.contains("disabled"));
+
+  let (status, body) =
+    send_rpc_request(&srv.admin_url, "admin_delete_api_key", json!([client_key.clone()]), 3307)
+      .await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(rpc.error.is_none(), "admin_delete_api_key should succeed");
+
+  let (status, body) =
+    send_rpc_request(&json_url, "eth_getProof", json!([12345, "x", "y"]), 3308).await;
+  assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+  assert!(body.contains("Unknown API key"));
+
+  let (status, body) =
+    send_rpc_request(&srv.admin_url, "admin_disable_api_key", json!([admin_key]), 3309).await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert_rpc_error(&rpc, -32602, "cannot be disabled or deleted");
 }
