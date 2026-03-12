@@ -1,10 +1,11 @@
 //! Shared state for the rpc service.
 //!
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use rostl_datastructures::map::UnsortedMap;
 use rostl_primitives::traits::Cmov;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::authentication::{ApiKeyController, ApiKeyError};
@@ -71,6 +72,34 @@ impl RpcMetrics {
   }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MissingBlockHashSelector {
+  #[serde(rename = "blockHash")]
+  pub block_hash: String,
+  #[serde(rename = "requireCanonical")]
+  pub require_canonical: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(untagged)]
+pub enum MissingBlockId {
+  Number(u64),
+  BlockHash(MissingBlockHashSelector),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MissingProofQuery {
+  pub address: String,
+  pub storage_keys: Vec<String>,
+  pub block: MissingBlockId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct MissingProofGroupKey {
+  address: String,
+  block: MissingBlockId,
+}
+
 pub struct SharedState {
   pub storage: Arc<Mutex<UnsortedMap<B256, ObliviousNode>>>,
   /// block_number -> state_root
@@ -79,21 +108,42 @@ pub struct SharedState {
   pub latest_root_by_number: Arc<Mutex<Option<(u64, B256)>>>,
   /// block_hash -> state_root
   pub roots_by_hash: Arc<Mutex<UnsortedMap<B256, B256>>>,
+  /// NOTE(obliviousness): this cache is not secret-data-independent.
+  /// It leaks block selector and duplicate status for `(address, block, storage_key)`
+  /// via instruction and memory-access traces in map/set insertions.
+  /// Missing proof queries grouped by `(address, block)` with deduped storage keys.
+  missing_proof_queries: Arc<Mutex<HashMap<MissingProofGroupKey, HashSet<String>>>>,
+  /// Runtime toggle for leaky error recovery (missing-proof queue/backfill path).
+  pub leaky_error_recovery: bool,
   pub metrics: Arc<Mutex<RpcMetrics>>,
   pub api_keys: Arc<Mutex<ApiKeyController>>,
 }
 
 impl SharedState {
   pub fn new(cap: usize) -> Self {
-    Self::new_with_admin_key(cap, "olabs-admin-dev-key-please-change".to_string())
+    Self::new_with_admin_key_and_leaky_error_recovery(
+      cap,
+      "olabs-admin-dev-key-please-change".to_string(),
+      true,
+    )
   }
 
   pub fn new_with_admin_key(cap: usize, admin_api_key: String) -> Self {
+    Self::new_with_admin_key_and_leaky_error_recovery(cap, admin_api_key, true)
+  }
+
+  pub fn new_with_admin_key_and_leaky_error_recovery(
+    cap: usize,
+    admin_api_key: String,
+    leaky_error_recovery: bool,
+  ) -> Self {
     Self {
       storage: Arc::new(Mutex::new(UnsortedMap::new(1 << 10))),
       roots_by_number: Arc::new(Mutex::new(UnsortedMap::new(cap))),
       latest_root_by_number: Arc::new(Mutex::new(None)),
       roots_by_hash: Arc::new(Mutex::new(UnsortedMap::new(cap))),
+      missing_proof_queries: Arc::new(Mutex::new(HashMap::new())),
+      leaky_error_recovery,
       metrics: Arc::new(Mutex::new(RpcMetrics::default())),
       api_keys: Arc::new(Mutex::new(ApiKeyController::new(admin_api_key))),
     }
@@ -142,6 +192,42 @@ impl SharedState {
 
   pub async fn get_latest_root(&self) -> Option<B256> {
     self.latest_root_by_number.lock().await.as_ref().map(|(_, root)| *root)
+  }
+
+  pub async fn get_latest_root_with_number(&self) -> Option<(u64, B256)> {
+    self.latest_root_by_number.lock().await.as_ref().copied()
+  }
+
+  pub async fn record_missing_proof_query(&self, query: MissingProofQuery) {
+    if !self.leaky_error_recovery {
+      return;
+    }
+    let mut guard = self.missing_proof_queries.lock().await;
+    let key = MissingProofGroupKey { address: query.address, block: query.block };
+    let entry = guard.entry(key).or_insert_with(HashSet::new);
+    for storage_key in query.storage_keys {
+      entry.insert(storage_key);
+    }
+  }
+
+  pub async fn take_missing_proof_queries(&self) -> Vec<MissingProofQuery> {
+    if !self.leaky_error_recovery {
+      return Vec::new();
+    }
+    let mut guard = self.missing_proof_queries.lock().await;
+    let groups = std::mem::take(&mut *guard);
+    let mut out = Vec::with_capacity(groups.len());
+    for (group, storage_keys) in groups {
+      let mut keys: Vec<String> = storage_keys.into_iter().collect();
+      keys.sort_unstable();
+      out.push(MissingProofQuery {
+        address: group.address,
+        storage_keys: keys,
+        block: group.block,
+      });
+    }
+    out.sort_by(|a, b| a.address.cmp(&b.address).then_with(|| a.block.cmp(&b.block)));
+    out
   }
 
   pub async fn metrics_snapshot(&self) -> RpcMetrics {
@@ -231,6 +317,57 @@ mod tests {
 
     state.set_root(101, root_101).await;
     assert_eq!(state.get_latest_root().await, Some(root_101));
+  }
+
+  #[tokio::test]
+  async fn test_record_and_take_missing_proof_queries_merges_and_clears_queue() {
+    let state = SharedState::new(1 << 10);
+    let block = MissingBlockId::Number(42);
+    state
+      .record_missing_proof_query(MissingProofQuery {
+        address: "0x1111111111111111111111111111111111111111".to_string(),
+        storage_keys: vec!["0x01".to_string()],
+        block: block.clone(),
+      })
+      .await;
+    state
+      .record_missing_proof_query(MissingProofQuery {
+        address: "0x1111111111111111111111111111111111111111".to_string(),
+        storage_keys: vec!["0x02".to_string()],
+        block: block.clone(),
+      })
+      .await;
+    state
+      .record_missing_proof_query(MissingProofQuery {
+        address: "0x1111111111111111111111111111111111111111".to_string(),
+        storage_keys: vec!["0x01".to_string()],
+        block,
+      })
+      .await;
+
+    let taken = state.take_missing_proof_queries().await;
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].storage_keys, vec!["0x01".to_string(), "0x02".to_string()]);
+
+    let taken_again = state.take_missing_proof_queries().await;
+    assert!(taken_again.is_empty());
+  }
+
+  #[tokio::test]
+  async fn test_leaky_error_recovery_disabled_does_not_store_queries() {
+    let state = SharedState::new_with_admin_key_and_leaky_error_recovery(
+      1 << 10,
+      "olabs-admin-key-test".to_string(),
+      false,
+    );
+    state
+      .record_missing_proof_query(MissingProofQuery {
+        address: "0x1111111111111111111111111111111111111111".to_string(),
+        storage_keys: vec!["0x01".to_string()],
+        block: MissingBlockId::Number(1),
+      })
+      .await;
+    assert!(state.take_missing_proof_queries().await.is_empty());
   }
 
   #[test]

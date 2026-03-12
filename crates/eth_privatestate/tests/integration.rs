@@ -664,6 +664,31 @@ async fn integration_rpc_admin_get_metrics_reports_counters() {
 }
 
 #[tokio::test]
+async fn integration_rpc_admin_apply_block_delta_sets_roots() {
+  let (srv, state) = TestServer::start(1 << 10).await;
+
+  let mut stream = rlp::RlpStream::new_list(2);
+  stream.append(&vec![0u8]);
+  stream.append(&b"value".to_vec());
+  let node_hex = format!("0x{}", hex::encode(stream.out().to_vec()));
+
+  let block_number = 77u64;
+  let block_hash = B256([0x44; 32]).to_hex();
+  let root = B256([0x55; 32]).to_hex();
+  let params = json!([block_number, block_hash.clone(), root.clone(), [node_hex], true]);
+
+  let (status, body) = send_rpc_request(&srv.url, "admin_apply_block_delta", params, 2050).await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(rpc.error.is_none(), "admin_apply_block_delta should succeed");
+
+  let root_b256 = B256::from_hex(&root).unwrap();
+  let hash_b256 = B256::from_hex(&block_hash).unwrap();
+  assert_eq!(state.get_root_by_hash(hash_b256).await, Some(root_b256));
+  assert_eq!(state.get_root(block_number).await, Some(root_b256));
+}
+
+#[tokio::test]
 async fn integration_routed_rpc_api_key_tokens_and_admin_permissions() {
   let admin_key = "olabs-admin-00000000000000000000000000000000";
   let (srv, _state) = RoutedTestServer::start(1 << 10, admin_key).await;
@@ -818,4 +843,54 @@ async fn integration_routed_rpc_admin_can_disable_and_delete_api_key() {
   assert!(status.is_success());
   let rpc = parse_rpc_response(&body).expect("invalid RPC response");
   assert_rpc_error(&rpc, -32602, "cannot be disabled or deleted");
+}
+
+#[tokio::test]
+async fn integration_routed_rpc_take_missing_nodes_reports_and_clears_queue() {
+  let admin_key = "olabs-admin-44444444444444444444444444444444";
+  let (srv, _state) = RoutedTestServer::start(1 << 10, admin_key).await;
+
+  let root_hash =
+    B256::from_hex("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+  let (status, body) =
+    send_rpc_request(&srv.admin_url, "admin_set_root", json!([1u64, root_hash.to_hex()]), 3401)
+      .await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(rpc.error.is_none(), "admin_set_root should succeed");
+
+  let json_url = srv.json_url_for_key(admin_key);
+  let (status, body) = send_eth_get_proof(
+    &json_url,
+    &H160::from_hex("0x0000000000000000000000000000000000000000").unwrap(),
+    &[],
+    json!(1),
+    3402,
+  )
+  .await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert_rpc_error(&rpc, -32001, "data non availability");
+
+  let (status, body) =
+    send_rpc_request(&srv.admin_url, "admin_take_missing_nodes", json!([]), 3403).await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(rpc.error.is_none());
+  let queries = rpc.result.expect("missing result").as_array().cloned().expect("result array");
+  assert_eq!(queries.len(), 1);
+  let q = queries[0].as_object().expect("query object");
+  assert_eq!(
+    q.get("address").and_then(|v| v.as_str()),
+    Some("0x0000000000000000000000000000000000000000")
+  );
+  assert_eq!(q.get("storage_keys").and_then(|v| v.as_array()).map(|v| v.len()), Some(0));
+  assert_eq!(q.get("block"), Some(&json!(1)));
+
+  let (status, body) =
+    send_rpc_request(&srv.admin_url, "admin_take_missing_nodes", json!([]), 3404).await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(rpc.error.is_none());
+  assert_eq!(rpc.result.unwrap().as_array().unwrap().len(), 0);
 }

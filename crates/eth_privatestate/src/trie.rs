@@ -15,7 +15,7 @@ const MAX_SLOTS: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProofError {
-  MissingNode,
+  MissingNode(B256),
   TraversalCapExceeded,
 }
 
@@ -53,7 +53,7 @@ pub async fn generate_proof<const ADDR_LEN: usize>(
     // Missing nodes are treated as data non-availability for the requested root.
     // We fail fast here and map this to `ProofError::MissingNode`.
     if enabled & (ob_node.rlp_length == 0) {
-      return Err(ProofError::MissingNode);
+      return Err(ProofError::MissingNode(B256(curr_hash)));
     }
 
     ret_proof.push_str(unsafe {
@@ -187,10 +187,9 @@ mod tests {
 
     let res =
       generate_proof::<2>(&storage, B256::zero(), &key, &mut ret_proof, &mut ret_value).await;
-    assert_eq!(
-      res,
-      Err(ProofError::MissingNode),
-      "missing nodes should cause generate_proof to return MissingNode"
+    assert!(
+      matches!(res, Err(ProofError::MissingNode(_))),
+      "missing nodes should cause generate_proof to return MissingNode(_)"
     );
   }
 
@@ -495,7 +494,7 @@ mod tests {
         generate_proof::<1>(&storage, selected_root, &key, &mut ret_proof, &mut ret_value).await
       });
 
-      prop_assert!(matches!(res, Ok(()) | Err(ProofError::MissingNode)));
+      prop_assert!(matches!(res, Ok(()) | Err(ProofError::MissingNode(_))));
     }
   }
 }

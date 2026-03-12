@@ -10,7 +10,19 @@ use jsonrpsee::types::ErrorCode;
 use crate::authentication::ApiKeyError;
 use crate::oblivious_node::ObliviousNode;
 use crate::rpc::{decode_b256_hex, invalid_params_error, observe_rpc_result};
-use crate::state::SharedState;
+use crate::state::{MissingProofQuery, SharedState};
+
+fn parse_oblivious_node(node_hex: &str) -> Result<ObliviousNode, ErrorObjectOwned> {
+  let raw = node_hex.strip_prefix("0x").unwrap_or(node_hex);
+  let node_bytes = hex::decode(raw).map_err(|_| {
+    ErrorObjectOwned::owned(-32602, "Failed to decode node hex".to_string(), None::<()>)
+  })?;
+  ObliviousNode::from_rlp(&node_bytes).ok_or(ErrorObjectOwned::owned(
+    -32602,
+    "Failed to parse node RLP into ObliviousNode".to_string(),
+    None::<()>,
+  ))
+}
 
 fn map_api_key_error(err: ApiKeyError) -> ErrorObjectOwned {
   match err {
@@ -51,14 +63,7 @@ pub fn register_admin_rpc(state: Arc<SharedState>) -> anyhow::Result<RpcModule<A
       let started = Instant::now();
       let res: Result<bool, ErrorObjectOwned> = async {
         let node_hex: String = params.parse().map_err(|_| invalid_params_error())?;
-        let node_bytes = hex::decode(node_hex.trim_start_matches("0x")).map_err(|_| {
-          ErrorObjectOwned::owned(-32602, "Failed to decode node hex".to_string(), None::<()>)
-        })?;
-        let ob = ObliviousNode::from_rlp(&node_bytes).ok_or(ErrorObjectOwned::owned(
-          -32602,
-          "Failed to parse node RLP into ObliviousNode".to_string(),
-          None::<()>,
-        ))?;
+        let ob = parse_oblivious_node(&node_hex)?;
         let hh = ob.keccak_hash();
         {
           let mut guard = state.storage.lock().await;
@@ -107,6 +112,47 @@ pub fn register_admin_rpc(state: Arc<SharedState>) -> anyhow::Result<RpcModule<A
     }
   })?;
 
+  module.register_async_method("admin_apply_block_delta", move |params, ctx, _| {
+    let state = ctx.as_ref().clone();
+    async move {
+      let started = Instant::now();
+      let res: Result<bool, ErrorObjectOwned> = async {
+        let (block_number, block_hash_hex, root_hex, node_hexes, publish_root_by_number): (
+          u64,
+          String,
+          String,
+          Vec<String>,
+          bool,
+        ) = params.parse().map_err(|_| invalid_params_error())?;
+
+        let block_hash = decode_b256_hex(&block_hash_hex, "block hash")?;
+        let root = decode_b256_hex(&root_hex, "root")?;
+
+        let mut parsed_nodes = Vec::with_capacity(node_hexes.len());
+        for node_hex in node_hexes {
+          parsed_nodes.push(parse_oblivious_node(&node_hex)?);
+        }
+
+        {
+          let mut guard = state.storage.lock().await;
+          for ob in parsed_nodes {
+            let hh = ob.keccak_hash();
+            guard.insert(hh, ob);
+          }
+        }
+
+        state.set_root_by_hash(block_hash, root).await;
+        if publish_root_by_number {
+          state.set_root(block_number, root).await;
+        }
+        Ok::<_, ErrorObjectOwned>(true)
+      }
+      .await;
+      observe_rpc_result(state.as_ref(), "admin_apply_block_delta", started, &res).await;
+      res
+    }
+  })?;
+
   module.register_async_method("admin_get_metrics", move |params, ctx, _| {
     let state = ctx.as_ref().clone();
     async move {
@@ -114,6 +160,20 @@ pub fn register_admin_rpc(state: Arc<SharedState>) -> anyhow::Result<RpcModule<A
       let _ = params;
       let res: Result<_, ErrorObjectOwned> = Ok(state.metrics_snapshot().await);
       observe_rpc_result(state.as_ref(), "admin_get_metrics", started, &res).await;
+      res
+    }
+  })?;
+
+  module.register_async_method("admin_take_missing_nodes", move |params, ctx, _| {
+    let state = ctx.as_ref().clone();
+    async move {
+      let started = Instant::now();
+      let res: Result<Vec<MissingProofQuery>, ErrorObjectOwned> = async {
+        let _: Vec<serde_json::Value> = params.parse().map_err(|_| invalid_params_error())?;
+        Ok::<_, ErrorObjectOwned>(state.take_missing_proof_queries().await)
+      }
+      .await;
+      observe_rpc_result(state.as_ref(), "admin_take_missing_nodes", started, &res).await;
       res
     }
   })?;

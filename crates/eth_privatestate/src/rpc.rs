@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use crate::oblivious_node::VALUE_BUF;
-use crate::state::SharedState;
+use crate::state::{MissingBlockHashSelector, MissingBlockId, MissingProofQuery, SharedState};
 use crate::trie::{self, parse_account, ProofError};
 use crate::types::{B256, H160};
 
@@ -96,13 +96,6 @@ fn traversal_cap_exceeded_error() -> ErrorObjectOwned {
   ErrorObjectOwned::owned(-32002, "Failed due to traversal cap exceeded".to_string(), None::<()>)
 }
 
-fn map_proof_error(err: ProofError) -> ErrorObjectOwned {
-  match err {
-    ProofError::MissingNode => data_non_availability_error(),
-    ProofError::TraversalCapExceeded => traversal_cap_exceeded_error(),
-  }
-}
-
 fn serialization_error<E: std::fmt::Display>(err: E) -> ErrorObjectOwned {
   ErrorObjectOwned::owned(-32603, format!("Serialization error: {}", err), None::<()>)
 }
@@ -132,35 +125,67 @@ pub(crate) async fn observe_rpc_result<T>(
 
 pub(crate) fn decode_b256_hex(value: &str, field: &str) -> Result<B256, ErrorObjectOwned> {
   let parsed = B256::from_hex(value);
-  if !parsed.is_some() {
-    return Err(invalid_hex_error(field));
+  if parsed.is_some() {
+    Ok(parsed.unwrap_or_default())
+  } else {
+    Err(invalid_hex_error(field))
   }
-  Ok(parsed.unwrap_or_default())
 }
 
 fn decode_h160_hex(value: &str, field: &str) -> Result<H160, ErrorObjectOwned> {
   let parsed = H160::from_hex(value);
-  if !parsed.is_some() {
-    return Err(invalid_hex_error(field));
+  if parsed.is_some() {
+    Ok(parsed.unwrap())
+  } else {
+    Err(invalid_hex_error(field))
   }
-  Ok(parsed.unwrap())
+}
+
+async fn handle_proof_result(
+  state: &SharedState,
+  missing_query: &MissingProofQuery,
+  res: Result<(), ProofError>,
+) -> Result<(), ErrorObjectOwned> {
+  match res {
+    Ok(()) => Ok(()),
+    Err(ProofError::MissingNode(_)) => {
+      state.record_missing_proof_query(missing_query.clone()).await;
+      Err(data_non_availability_error())
+    }
+    Err(ProofError::TraversalCapExceeded) => Err(traversal_cap_exceeded_error()),
+  }
 }
 
 async fn resolve_root_for_selector(
   state: &SharedState,
   block_selector: BlockSelector,
-) -> Result<Option<B256>, ErrorObjectOwned> {
+) -> Result<Option<(B256, MissingBlockId)>, ErrorObjectOwned> {
   match block_selector {
-    BlockSelector::Number(block_num) => Ok(state.get_root(block_num).await),
+    BlockSelector::Number(block_num) => {
+      Ok(state.get_root(block_num).await.map(|root| (root, MissingBlockId::Number(block_num))))
+    }
     BlockSelector::BlockHash(selector) => {
       if selector.require_canonical == Some(true) {
         return Err(unsupported_error("requireCanonical=true is unsupported"));
       }
       let block_hash = decode_b256_hex(&selector.block_hash, "block hash")?;
-      Ok(state.get_root_by_hash(block_hash).await)
+      Ok(state.get_root_by_hash(block_hash).await.map(|root| {
+        (
+          root,
+          MissingBlockId::BlockHash(MissingBlockHashSelector {
+            block_hash: block_hash.to_hex(),
+            require_canonical: false,
+          }),
+        )
+      }))
     }
     BlockSelector::Tag(tag) => match tag.as_str() {
-      "latest" => Ok(state.get_latest_root().await),
+      "latest" => Ok(
+        state
+          .get_latest_root_with_number()
+          .await
+          .map(|(number, root)| (root, MissingBlockId::Number(number))),
+      ),
       _ => Err(unsupported_error("Unsupported block tag")),
     },
   }
@@ -200,29 +225,43 @@ pub async fn eth_get_proof_handler(
   let GetProofParams(address_hex, storage_keys, block_selector) = params;
 
   // Parse all public request fields before touching trie state.
-  let address = decode_h160_hex(&address_hex, "address")?.keccak_hash();
+  let parsed_address = decode_h160_hex(&address_hex, "address")?;
+  let address_hex = parsed_address.to_hex();
+  let address = parsed_address.keccak_hash();
   let mut parsed_storage_keys: Vec<(String, B256)> = Vec::with_capacity(storage_keys.len());
+  let mut missing_storage_keys: Vec<String> = Vec::with_capacity(storage_keys.len());
   for key_hex in storage_keys {
-    let key_hash = decode_b256_hex(&key_hex, "storage key")?.keccak_hash();
+    let key = decode_b256_hex(&key_hex, "storage key")?;
+    let key_hash = key.keccak_hash();
+    missing_storage_keys.push(key.to_hex());
     parsed_storage_keys.push((key_hex, key_hash));
   }
 
   // get root for the requested block selector
-  let root_opt = resolve_root_for_selector(state.as_ref(), block_selector).await?;
-  let root = root_opt.ok_or_else(data_non_availability_error)?;
+  let root_with_selector = resolve_root_for_selector(state.as_ref(), block_selector).await?;
+  let (root, missing_block) = root_with_selector.ok_or_else(data_non_availability_error)?;
+  let missing_query = MissingProofQuery {
+    address: address_hex,
+    storage_keys: missing_storage_keys,
+    block: missing_block,
+  };
 
   // generate account proof; if missing -> error
   let mut ret_proof = String::new();
   let mut ret_value = [0u8; VALUE_BUF];
-  trie::generate_proof::<64>(
-    &state.storage,
-    root,
-    &address.to_nibbles(),
-    &mut ret_proof,
-    &mut ret_value,
+  handle_proof_result(
+    state.as_ref(),
+    &missing_query,
+    trie::generate_proof::<64>(
+      &state.storage,
+      root,
+      &address.to_nibbles(),
+      &mut ret_proof,
+      &mut ret_value,
+    )
+    .await,
   )
-  .await
-  .map_err(map_proof_error)?;
+  .await?;
 
   let account_proof_rv = RawValue::from_string(ret_proof).map_err(serialization_error)?;
 
@@ -232,15 +271,19 @@ pub async fn eth_get_proof_handler(
   for (key_hex, key_hash) in parsed_storage_keys {
     let mut ret_proof = String::new();
     let mut ret_value = [0u8; VALUE_BUF];
-    trie::generate_proof::<64>(
-      &state.storage,
-      storage_hash,
-      &key_hash.to_nibbles(),
-      &mut ret_proof,
-      &mut ret_value,
+    handle_proof_result(
+      state.as_ref(),
+      &missing_query,
+      trie::generate_proof::<64>(
+        &state.storage,
+        storage_hash,
+        &key_hash.to_nibbles(),
+        &mut ret_proof,
+        &mut ret_value,
+      )
+      .await,
     )
-    .await
-    .map_err(map_proof_error)?;
+    .await?;
     let proof_rv = RawValue::from_string(ret_proof).map_err(serialization_error)?;
 
     let value_rv = trie::parse_value(ret_value.as_slice());

@@ -1,0 +1,25 @@
+[package]
+name = "eth_sync_feeder"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+hex.workspace = true
+tokio = { workspace = true, features = ["process", "signal", "time"] }
+reqwest.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+log.workspace = true
+eth_privatestate.workspace = true
+
+[dev-dependencies]
+jsonrpsee.workspace = true
+ethers-core.workspace = true
+ethers-signers.workspace = true
+sha3.workspace = true
