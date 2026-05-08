@@ -9,7 +9,9 @@ use std::fmt::{Display, Formatter};
 
 use eth_privatestate::state::MissingProofQuery;
 
-use crate::{BlockDelta, BlockRef, ChainUpdate, FeederFuture, RethSyncSource};
+use crate::{
+  BlockDelta, BlockRef, ChainUpdate, FeederFuture, MissingProofBackfill, RethSyncSource, SyncLane,
+};
 
 /// One canonical block payload produced by a reth-facing provider.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,6 +24,10 @@ pub struct RethBlockBundle {
   pub state_root_hex: String,
   /// Changed trie nodes in this block as raw RLP.
   pub changed_trie_nodes_rlp: Vec<Vec<u8>>,
+  /// Root/node sync lane that produced this bundle.
+  pub sync_lane: SyncLane,
+  /// True when this bundle was produced by a complete proactive node-delta fetch.
+  pub node_delta_complete: bool,
 }
 
 /// Canonical notifications from reth source.
@@ -60,6 +66,20 @@ pub trait RethUpdateProvider {
     &mut self,
     query: MissingProofQuery,
   ) -> FeederFuture<'_, Result<Vec<Vec<u8>>, Self::Error>>;
+
+  /// Fetches proof nodes plus any block root metadata needed for retry.
+  fn fetch_missing_proof(
+    &mut self,
+    query: MissingProofQuery,
+  ) -> FeederFuture<'_, Result<MissingProofBackfill, Self::Error>>
+  where
+    Self: Send,
+  {
+    Box::pin(async move {
+      let nodes_rlp = self.fetch_missing_proof_nodes(query).await?;
+      Ok(MissingProofBackfill { nodes_rlp, root_by_number: None, root_by_hash: None })
+    })
+  }
 }
 
 /// Error wrapper used by `RethSourceAdapter`.
@@ -104,6 +124,8 @@ impl<P> RethSourceAdapter<P> {
       hash_hex: bundle.hash_hex,
       state_root_hex: bundle.state_root_hex,
       changed_trie_nodes_rlp: bundle.changed_trie_nodes_rlp,
+      sync_lane: bundle.sync_lane,
+      node_delta_complete: bundle.node_delta_complete,
     }
   }
 }
@@ -148,6 +170,15 @@ where
   ) -> FeederFuture<'_, Result<Vec<Vec<u8>>, Self::Error>> {
     Box::pin(async move {
       self.provider.fetch_missing_proof_nodes(query).await.map_err(RethSourceError::Provider)
+    })
+  }
+
+  fn fetch_missing_proof(
+    &mut self,
+    query: MissingProofQuery,
+  ) -> FeederFuture<'_, Result<MissingProofBackfill, Self::Error>> {
+    Box::pin(async move {
+      self.provider.fetch_missing_proof(query).await.map_err(RethSourceError::Provider)
     })
   }
 }
@@ -218,6 +249,8 @@ mod tests {
         hash_hex: "0x11".to_string(),
         state_root_hex: "0xaa".to_string(),
         changed_trie_nodes_rlp: vec![vec![0x01u8, 0x02u8]],
+        sync_lane: SyncLane::Historical,
+        node_delta_complete: true,
       }],
       notifications: VecDeque::new(),
       nodes_by_query: HashMap::from([(
@@ -252,6 +285,8 @@ mod tests {
             hash_hex: "0xnew".to_string(),
             state_root_hex: "0xroot".to_string(),
             changed_trie_nodes_rlp: vec![vec![0x99]],
+            sync_lane: SyncLane::Live,
+            node_delta_complete: true,
           }],
         },
         RethNotification::Reverted(vec![BlockRef { number: 11, hash_hex: "0x11".to_string() }]),

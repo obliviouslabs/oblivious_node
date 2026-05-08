@@ -94,6 +94,22 @@ pub struct MissingProofQuery {
   pub block: MissingBlockId,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncProgressLane {
+  Historical,
+  Live,
+}
+
+impl SyncProgressLane {
+  pub fn parse(value: &str) -> Option<Self> {
+    match value {
+      "historical" => Some(Self::Historical),
+      "live" => Some(Self::Live),
+      _ => None,
+    }
+  }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct MissingProofGroupKey {
   address: String,
@@ -106,6 +122,16 @@ pub struct SharedState {
   pub roots_by_number: Arc<Mutex<UnsortedMap<u64, B256>>>,
   /// latest root set via `admin_set_root` (block_number, state_root)
   pub latest_root_by_number: Arc<Mutex<Option<(u64, B256)>>>,
+  /// latest block root published by startup/historical root sync.
+  pub latest_historical_root_number: Arc<Mutex<Option<u64>>>,
+  /// latest block root published by live root sync.
+  pub latest_live_root_number: Arc<Mutex<Option<u64>>>,
+  /// latest block whose proactive node delta was applied.
+  pub latest_node_delta_number: Arc<Mutex<Option<u64>>>,
+  /// latest block whose startup/historical proactive node delta was applied.
+  pub latest_historical_node_delta_number: Arc<Mutex<Option<u64>>>,
+  /// latest block whose live proactive node delta was applied.
+  pub latest_live_node_delta_number: Arc<Mutex<Option<u64>>>,
   /// block_hash -> state_root
   pub roots_by_hash: Arc<Mutex<UnsortedMap<B256, B256>>>,
   /// NOTE(obliviousness): this cache is not secret-data-independent.
@@ -141,6 +167,11 @@ impl SharedState {
       storage: Arc::new(Mutex::new(UnsortedMap::new(1 << 10))),
       roots_by_number: Arc::new(Mutex::new(UnsortedMap::new(cap))),
       latest_root_by_number: Arc::new(Mutex::new(None)),
+      latest_historical_root_number: Arc::new(Mutex::new(None)),
+      latest_live_root_number: Arc::new(Mutex::new(None)),
+      latest_node_delta_number: Arc::new(Mutex::new(None)),
+      latest_historical_node_delta_number: Arc::new(Mutex::new(None)),
+      latest_live_node_delta_number: Arc::new(Mutex::new(None)),
       roots_by_hash: Arc::new(Mutex::new(UnsortedMap::new(cap))),
       missing_proof_queries: Arc::new(Mutex::new(HashMap::new())),
       leaky_error_recovery,
@@ -151,7 +182,15 @@ impl SharedState {
 
   pub async fn set_root(&self, block: u64, root: B256) {
     let mut guard = self.roots_by_number.lock().await;
-    guard.insert(block, root);
+    let mut existing = B256::zero();
+    if guard.get(block, &mut existing) {
+      guard.write(block, root);
+    } else {
+      guard.insert(block, root);
+    }
+    for _ in 0..16 {
+      guard.deamortize_insertion_queue();
+    }
 
     let mut latest_guard = self.latest_root_by_number.lock().await;
     let should_update =
@@ -175,7 +214,15 @@ impl SharedState {
 
   pub async fn set_root_by_hash(&self, block_hash: B256, root: B256) {
     let mut guard = self.roots_by_hash.lock().await;
-    guard.insert(block_hash, root);
+    let mut existing = B256::zero();
+    if guard.get(block_hash, &mut existing) {
+      guard.write(block_hash, root);
+    } else {
+      guard.insert(block_hash, root);
+    }
+    for _ in 0..16 {
+      guard.deamortize_insertion_queue();
+    }
   }
 
   // NOTE: We are leaking whether the root exists or not, this is acceptable as we don't care about hiding data in invalid requests.
@@ -196,6 +243,119 @@ impl SharedState {
 
   pub async fn get_latest_root_with_number(&self) -> Option<(u64, B256)> {
     self.latest_root_by_number.lock().await.as_ref().copied()
+  }
+
+  pub async fn apply_root_batch(
+    &self,
+    roots: &[(u64, B256, B256)],
+    publish_root_by_number: bool,
+    lane: Option<SyncProgressLane>,
+  ) {
+    if roots.is_empty() {
+      return;
+    }
+
+    {
+      let mut guard = self.roots_by_hash.lock().await;
+      for (_, block_hash, root) in roots {
+        let mut existing = B256::zero();
+        if guard.get(*block_hash, &mut existing) {
+          guard.write(*block_hash, *root);
+        } else {
+          guard.insert(*block_hash, *root);
+        }
+      }
+      for _ in 0..roots.len().saturating_mul(16) {
+        guard.deamortize_insertion_queue();
+      }
+    }
+
+    let mut latest_in_batch: Option<(u64, B256)> = None;
+    if publish_root_by_number {
+      let mut guard = self.roots_by_number.lock().await;
+      for (block, _, root) in roots {
+        let mut existing = B256::zero();
+        if guard.get(*block, &mut existing) {
+          guard.write(*block, *root);
+        } else {
+          guard.insert(*block, *root);
+        }
+        if latest_in_batch.map_or(true, |(latest, _)| *block >= latest) {
+          latest_in_batch = Some((*block, *root));
+        }
+      }
+      for _ in 0..roots.len().saturating_mul(16) {
+        guard.deamortize_insertion_queue();
+      }
+    } else {
+      for (block, _, root) in roots {
+        if latest_in_batch.map_or(true, |(latest, _)| *block >= latest) {
+          latest_in_batch = Some((*block, *root));
+        }
+      }
+    }
+
+    if let Some((block, root)) = latest_in_batch {
+      if publish_root_by_number {
+        let mut latest_guard = self.latest_root_by_number.lock().await;
+        let should_update =
+          latest_guard.as_ref().map_or(true, |(latest_block, _)| block >= *latest_block);
+        if should_update {
+          *latest_guard = Some((block, root));
+        }
+      }
+      if let Some(lane) = lane {
+        self.mark_root_progress(block, lane).await;
+      }
+    }
+  }
+
+  pub async fn mark_root_progress(&self, block: u64, lane: SyncProgressLane) {
+    let target = match lane {
+      SyncProgressLane::Historical => &self.latest_historical_root_number,
+      SyncProgressLane::Live => &self.latest_live_root_number,
+    };
+    let mut guard = target.lock().await;
+    if guard.map_or(true, |latest| block >= latest) {
+      *guard = Some(block);
+    }
+  }
+
+  pub async fn get_latest_historical_root_number(&self) -> Option<u64> {
+    *self.latest_historical_root_number.lock().await
+  }
+
+  pub async fn get_latest_live_root_number(&self) -> Option<u64> {
+    *self.latest_live_root_number.lock().await
+  }
+
+  pub async fn mark_node_delta_complete(&self, block: u64, lane: SyncProgressLane) {
+    let target = match lane {
+      SyncProgressLane::Historical => &self.latest_historical_node_delta_number,
+      SyncProgressLane::Live => &self.latest_live_node_delta_number,
+    };
+    let mut lane_guard = target.lock().await;
+    if lane_guard.map_or(true, |latest| block >= latest) {
+      *lane_guard = Some(block);
+    }
+    drop(lane_guard);
+
+    let mut guard = self.latest_node_delta_number.lock().await;
+    if guard.map_or(true, |latest| block >= latest) {
+      *guard = Some(block);
+    }
+  }
+
+  pub async fn get_latest_node_delta_number(&self) -> Option<u64> {
+    *self.latest_node_delta_number.lock().await
+  }
+
+  pub async fn get_latest_historical_node_delta_number(&self) -> Option<u64> {
+    *self.latest_historical_node_delta_number.lock().await
+  }
+
+  pub async fn get_latest_live_node_delta_number(&self) -> Option<u64> {
+    *self.latest_live_node_delta_number.lock().await
   }
 
   pub async fn record_missing_proof_query(&self, query: MissingProofQuery) {

@@ -221,6 +221,16 @@ pub fn bytes_to_hex_oblivious_hidden_size(bytes: &[u8], size: usize) -> String {
 }
 
 pub fn bytes_to_hex_oblivious_hidden_size_quoted(bytes: &[u8], size: usize) -> String {
+  if size == 0 {
+    let mut out = vec![b' '; (3 + bytes.len() * 2).max(5)];
+    out[0] = b'"';
+    out[1] = b'0';
+    out[2] = b'x';
+    out[3] = b'0';
+    out[4] = b'"';
+    return unsafe { String::from_utf8_unchecked(out) };
+  }
+
   let mut out = vec![0u8; 3 + bytes.len() * 2];
   out[0] = b'"';
   out[1] = b'0';

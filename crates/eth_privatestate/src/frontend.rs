@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use hyper::Method;
 use jsonrpsee::core::BoxError;
 use jsonrpsee::server::{
   serve, stop_channel, HttpBody, HttpRequest, HttpResponse, Methods, Server, ServerHandle,
@@ -14,6 +15,7 @@ use jsonrpsee::server::{
 use tokio::net::TcpListener;
 use tower::{Service, ServiceExt};
 
+use crate::attestation::{self, AttestationError};
 use crate::authentication::ApiKeyError;
 use crate::rpc::register_public_rpc;
 use crate::rpc_admin::register_admin_rpc;
@@ -50,6 +52,14 @@ fn text_http_response(status: u16, body: &str) -> HttpResponse<HttpBody> {
     .expect("response builder with static values should not fail")
 }
 
+fn json_http_response(status: u16, body: &str) -> HttpResponse<HttpBody> {
+  HttpResponse::builder()
+    .status(status)
+    .header("content-type", "application/json")
+    .body(HttpBody::from(body.to_string()))
+    .expect("response builder with static values should not fail")
+}
+
 fn api_key_http_response(err: ApiKeyError) -> HttpResponse<HttpBody> {
   match err {
     ApiKeyError::UnknownKey => text_http_response(401, "Unknown API key"),
@@ -64,6 +74,45 @@ fn api_key_http_response(err: ApiKeyError) -> HttpResponse<HttpBody> {
     ApiKeyError::HourlyLimitExceeded => {
       text_http_response(429, "API key exceeded hourly allowance")
     }
+  }
+}
+
+fn attestation_error_response(err: AttestationError) -> HttpResponse<HttpBody> {
+  let status = match &err {
+    AttestationError::BadRequest(_) => 400,
+    AttestationError::SocketUnavailable(_) => 503,
+    AttestationError::DstackHttp(_) => 502,
+    AttestationError::Internal(_) => 500,
+  };
+  let body = serde_json::json!({ "error": err.to_string() }).to_string();
+  json_http_response(status, &body)
+}
+
+async fn utility_http_response(
+  request: &HttpRequest<hyper::body::Incoming>,
+) -> Option<HttpResponse<HttpBody>> {
+  let path = request.uri().path();
+  match path {
+    "/healthz" => Some(text_http_response(200, "ok\n")),
+    "/attestation" => {
+      if request.method() != Method::GET {
+        return Some(text_http_response(405, "Use GET /attestation?report_data=0x..."));
+      }
+      match attestation::quote_for_query(request.uri().query()).await {
+        Ok(body) => Some(json_http_response(200, &body)),
+        Err(err) => Some(attestation_error_response(err)),
+      }
+    }
+    "/info" => {
+      if request.method() != Method::GET {
+        return Some(text_http_response(405, "Use GET /info"));
+      }
+      match attestation::info().await {
+        Ok(body) => Some(json_http_response(200, &body)),
+        Err(err) => Some(attestation_error_response(err)),
+      }
+    }
+    _ => None,
   }
 }
 
@@ -91,12 +140,15 @@ impl Service<HttpRequest<hyper::body::Incoming>> for RoutedHttpService {
     let admin_methods = self.admin_methods.clone();
     Box::pin(async move {
       let path = request.uri().path().to_string();
+      if let Some(response) = utility_http_response(&request).await {
+        return Ok(response);
+      }
       let (api_key, path_kind) = match parse_rpc_path(&path) {
         Some(v) => v,
         None => {
           return Ok(text_http_response(
             404,
-            "Path must be /{api_key}/json_rpc or /{api_key}/admin",
+            "Path must be /{api_key}/json_rpc, /{api_key}/admin, /attestation, /info, or /healthz",
           ));
         }
       };

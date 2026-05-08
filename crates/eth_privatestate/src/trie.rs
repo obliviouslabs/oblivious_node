@@ -12,6 +12,14 @@ use crate::oblivious_node::{ObliviousNode, NODE_BUF, VALUE_BUF};
 use crate::types::{bytes_to_hex_oblivious_hidden_size_quoted, B256};
 
 const MAX_SLOTS: usize = 16;
+const EMPTY_STORAGE_ROOT: B256 = B256([
+  0x56, 0xe8, 0x1f, 0x17, 0x1b, 0xcc, 0x55, 0xa6, 0xff, 0x83, 0x45, 0xe6, 0x92, 0xc0, 0xf8, 0x6e,
+  0x5b, 0x48, 0xe0, 0x1b, 0x99, 0x6c, 0xad, 0xc0, 0x01, 0x62, 0x2f, 0xb5, 0xe3, 0x63, 0xb4, 0x21,
+]);
+const EMPTY_CODE_HASH: B256 = B256([
+  0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
+  0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
+]);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProofError {
@@ -85,6 +93,10 @@ pub async fn generate_proof<const ADDR_LEN: usize>(
 }
 
 pub fn parse_account(rlp_bytes: &[u8]) -> (String, String, B256, B256) {
+  if rlp_bytes.iter().all(|byte| *byte == 0) {
+    return ("\"0x0\"".to_string(), "\"0x0\"".to_string(), EMPTY_STORAGE_ROOT, EMPTY_CODE_HASH);
+  }
+
   let rlp_bytes = &rlp_bytes[2..];
   let mut s_nonce = [0u8; 32];
   let mut s_balance = [0u8; 32];
@@ -120,6 +132,10 @@ pub fn parse_account(rlp_bytes: &[u8]) -> (String, String, B256, B256) {
 /// Output format is `"0x..."` with trailing spaces so serialized token length is constant.
 /// Leaks: `rlp_bytes.len()`.
 pub fn parse_value(rlp_bytes: &[u8]) -> String {
+  if rlp_bytes.iter().all(|byte| *byte == 0) {
+    return "\"0x0\"".to_string();
+  }
+
   let mut rlp_bytes_local = vec![0u8; rlp_bytes.len()];
   let (_tp, size, _start) = ObliviousNode::rlp_decode_type_and_size(rlp_bytes, 0);
   oblivious_memcpy(&mut rlp_bytes_local, rlp_bytes, _start);
@@ -191,6 +207,41 @@ mod tests {
       matches!(res, Err(ProofError::MissingNode(_))),
       "missing nodes should cause generate_proof to return MissingNode(_)"
     );
+  }
+
+  #[test]
+  fn test_parse_account_non_member_returns_empty_account_defaults() {
+    let (nonce, balance, storage_hash, code_hash) = parse_account(&[0u8; VALUE_BUF]);
+
+    assert_eq!(nonce, "\"0x0\"");
+    assert_eq!(balance, "\"0x0\"");
+    assert_eq!(storage_hash, EMPTY_STORAGE_ROOT);
+    assert_eq!(code_hash, EMPTY_CODE_HASH);
+  }
+
+  #[test]
+  fn test_parse_account_empty_rlp_quantities_return_canonical_zero() {
+    let mut account = RlpStream::new_list(4);
+    account.append_empty_data();
+    account.append_empty_data();
+    account.append(&EMPTY_STORAGE_ROOT.0.as_ref());
+    account.append(&EMPTY_CODE_HASH.0.as_ref());
+
+    let account_rlp = account.out();
+    let mut value = [0u8; VALUE_BUF];
+    value[2..2 + account_rlp.len()].copy_from_slice(&account_rlp);
+
+    let (nonce, balance, storage_hash, code_hash) = parse_account(&value);
+
+    assert_eq!(nonce.trim_end(), "\"0x0\"");
+    assert_eq!(balance.trim_end(), "\"0x0\"");
+    assert_eq!(storage_hash, EMPTY_STORAGE_ROOT);
+    assert_eq!(code_hash, EMPTY_CODE_HASH);
+  }
+
+  #[test]
+  fn test_parse_value_non_member_returns_zero_quantity() {
+    assert_eq!(parse_value(&[0u8; VALUE_BUF]), "\"0x0\"");
   }
 
   #[tokio::test]

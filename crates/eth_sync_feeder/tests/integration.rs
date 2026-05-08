@@ -504,6 +504,8 @@ async fn build_contract_chain_fixture(
       hash_hex: info.hash_hex.clone(),
       state_root_hex: info.state_root_hex.clone(),
       changed_trie_nodes_rlp: nodes,
+      sync_lane: eth_sync_feeder::SyncLane::Historical,
+      node_delta_complete: true,
     })
   };
 

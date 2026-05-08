@@ -24,6 +24,25 @@ pub struct BlockRef {
   pub hash_hex: String,
 }
 
+/// Sync lane that produced a root or node update.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncLane {
+  /// Startup or configured historical/tail bootstrap lane.
+  Historical,
+  /// Ongoing live-follow lane.
+  Live,
+}
+
+impl SyncLane {
+  /// String representation sent over admin JSON-RPC.
+  pub fn as_str(self) -> &'static str {
+    match self {
+      Self::Historical => "historical",
+      Self::Live => "live",
+    }
+  }
+}
+
 /// Block payload published by the feeder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockDelta {
@@ -35,6 +54,10 @@ pub struct BlockDelta {
   pub state_root_hex: String,
   /// Full RLP-encoded trie nodes touched by this block.
   pub changed_trie_nodes_rlp: Vec<Vec<u8>>,
+  /// Root/node sync lane that produced this block delta.
+  pub sync_lane: SyncLane,
+  /// True when the source attempted a complete node delta for this block.
+  pub node_delta_complete: bool,
 }
 
 /// Canonical chain notifications consumed by the feeder.
@@ -78,6 +101,20 @@ pub trait RethSyncSource {
     &mut self,
     query: MissingProofQuery,
   ) -> FeederFuture<'_, Result<Vec<Vec<u8>>, Self::Error>>;
+
+  /// Fetches all data needed to make one missing-proof query retryable.
+  fn fetch_missing_proof(
+    &mut self,
+    query: MissingProofQuery,
+  ) -> FeederFuture<'_, Result<MissingProofBackfill, Self::Error>>
+  where
+    Self: Send,
+  {
+    Box::pin(async move {
+      let nodes_rlp = self.fetch_missing_proof_nodes(query).await?;
+      Ok(MissingProofBackfill { nodes_rlp, root_by_number: None, root_by_hash: None })
+    })
+  }
 }
 
 /// Consumer side contract: publishes updates into `eth_privatestate` admin API.
@@ -126,8 +163,37 @@ pub trait AdminSink {
       if publish_root_by_number {
         self.set_root_by_number(block.number, block.state_root_hex.clone()).await?;
       }
+      if block.node_delta_complete {
+        self.mark_node_delta_complete(block.number, block.sync_lane).await?;
+      }
       Ok(())
     })
+  }
+
+  /// Publishes a batch of block deltas.
+  fn publish_block_deltas<'a>(
+    &'a mut self,
+    blocks: &'a [BlockDelta],
+    publish_root_by_number: bool,
+  ) -> FeederFuture<'a, Result<(), Self::Error>>
+  where
+    Self: Send,
+  {
+    Box::pin(async move {
+      for block in blocks {
+        self.publish_block_delta(block, publish_root_by_number).await?;
+      }
+      Ok(())
+    })
+  }
+
+  /// Marks that witness/proactive node sync has reached this block.
+  fn mark_node_delta_complete(
+    &mut self,
+    _block_number: u64,
+    _sync_lane: SyncLane,
+  ) -> FeederFuture<'_, Result<(), Self::Error>> {
+    Box::pin(async move { Ok(()) })
   }
 }
 
@@ -140,6 +206,17 @@ pub struct MissingNodeBackfillResult {
   pub proof_requests: u64,
   /// Number of grouped requests where source returned no proof nodes.
   pub unresolved_queries: u64,
+}
+
+/// Proof data fetched to satisfy one missing-proof query.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct MissingProofBackfill {
+  /// Full RLP-encoded proof/trie nodes needed for the query.
+  pub nodes_rlp: Vec<Vec<u8>>,
+  /// Optional block-number root discovered while fetching the proof.
+  pub root_by_number: Option<(u64, String)>,
+  /// Optional block-hash root discovered while fetching the proof.
+  pub root_by_hash: Option<(String, String)>,
 }
 
 /// Sync runner that wires a reth source to an admin sink.
@@ -163,7 +240,7 @@ impl<S, K> RethSyncClient<S, K> {
 
 impl<S, K> RethSyncClient<S, K>
 where
-  S: RethSyncSource,
+  S: RethSyncSource + Send,
   K: AdminSink + Send,
 {
   /// Runs startup bootstrap by publishing initial state blocks from source.
@@ -174,10 +251,8 @@ where
       if blocks.is_empty() {
         break;
       }
-      for block in blocks {
-        self.publish_block(&block).await?;
-        published = published.saturating_add(1);
-      }
+      published = published.saturating_add(blocks.len() as u64);
+      self.publish_blocks(&blocks).await?;
     }
     Ok(published)
   }
@@ -197,9 +272,7 @@ where
       ChainUpdate::Reverted(_) => Vec::new(),
     };
 
-    for block in blocks {
-      self.publish_block(&block).await?;
-    }
+    self.publish_blocks(&blocks).await?;
     Ok(true)
   }
 
@@ -223,18 +296,42 @@ where
 
     for query in missing_queries {
       out.proof_requests = out.proof_requests.saturating_add(1);
-      let nodes = self.source.fetch_missing_proof_nodes(query).await.map_err(SyncError::Source)?;
-      if nodes.is_empty() {
+      let backfill = self.source.fetch_missing_proof(query).await.map_err(SyncError::Source)?;
+      let mut published_anything = false;
+      if backfill.nodes_rlp.is_empty()
+        && backfill.root_by_number.is_none()
+        && backfill.root_by_hash.is_none()
+      {
         out.unresolved_queries = out.unresolved_queries.saturating_add(1);
         continue;
       }
-      for node_rlp in nodes {
+      for node_rlp in backfill.nodes_rlp {
         self
           .sink
           .submit_node_rlp_hex(format!("0x{}", hex::encode(node_rlp)))
           .await
           .map_err(SyncError::Sink)?;
         out.published = out.published.saturating_add(1);
+        published_anything = true;
+      }
+      if let Some((block_hash_hex, state_root_hex)) = backfill.root_by_hash {
+        self
+          .sink
+          .set_root_by_hash(block_hash_hex, state_root_hex)
+          .await
+          .map_err(SyncError::Sink)?;
+        published_anything = true;
+      }
+      if let Some((block_number, state_root_hex)) = backfill.root_by_number {
+        self
+          .sink
+          .set_root_by_number(block_number, state_root_hex)
+          .await
+          .map_err(SyncError::Sink)?;
+        published_anything = true;
+      }
+      if !published_anything {
+        out.unresolved_queries = out.unresolved_queries.saturating_add(1);
       }
     }
 
@@ -252,11 +349,15 @@ where
     self.backfill_missing_nodes(missing_queries).await
   }
 
-  async fn publish_block(
+  async fn publish_blocks(
     &mut self,
-    block: &BlockDelta,
+    blocks: &[BlockDelta],
   ) -> Result<(), SyncError<S::Error, K::Error>> {
-    self.sink.publish_block_delta(block, self.publish_root_by_number).await.map_err(SyncError::Sink)
+    self
+      .sink
+      .publish_block_deltas(blocks, self.publish_root_by_number)
+      .await
+      .map_err(SyncError::Sink)
   }
 }
 
@@ -312,6 +413,7 @@ mod tests {
     initial_served: bool,
     updates: VecDeque<ChainUpdate>,
     missing_nodes_by_query: HashMap<(String, MissingBlockId), Vec<Vec<u8>>>,
+    missing_backfills_by_query: HashMap<(String, MissingBlockId), MissingProofBackfill>,
     seen_missing_queries: Vec<MissingProofQuery>,
   }
 
@@ -327,6 +429,16 @@ mod tests {
     fn with_missing_query_nodes(mut self, entries: Vec<(MissingProofQuery, Vec<Vec<u8>>)>) -> Self {
       for (query, nodes) in entries {
         self.missing_nodes_by_query.insert((query.address, query.block), nodes);
+      }
+      self
+    }
+
+    fn with_missing_query_backfills(
+      mut self,
+      entries: Vec<(MissingProofQuery, MissingProofBackfill)>,
+    ) -> Self {
+      for (query, backfill) in entries {
+        self.missing_backfills_by_query.insert((query.address, query.block), backfill);
       }
       self
     }
@@ -359,6 +471,24 @@ mod tests {
         Ok(self.missing_nodes_by_query.get(&key).cloned().unwrap_or_default())
       })
     }
+
+    fn fetch_missing_proof(
+      &mut self,
+      query: MissingProofQuery,
+    ) -> FeederFuture<'_, Result<MissingProofBackfill, Self::Error>> {
+      Box::pin(async move {
+        self.seen_missing_queries.push(query.clone());
+        let key = (query.address, query.block);
+        if let Some(backfill) = self.missing_backfills_by_query.get(&key).cloned() {
+          return Ok(backfill);
+        }
+        Ok(MissingProofBackfill {
+          nodes_rlp: self.missing_nodes_by_query.get(&key).cloned().unwrap_or_default(),
+          root_by_number: None,
+          root_by_hash: None,
+        })
+      })
+    }
   }
 
   #[derive(Default)]
@@ -366,6 +496,7 @@ mod tests {
     submitted_nodes: Vec<String>,
     roots_by_hash: Vec<(String, String)>,
     roots_by_number: Vec<(u64, String)>,
+    node_delta_complete_numbers: Vec<u64>,
     missing_queries_queue: Vec<MissingProofQuery>,
   }
 
@@ -409,6 +540,17 @@ mod tests {
     ) -> FeederFuture<'_, Result<Vec<MissingProofQuery>, Self::Error>> {
       Box::pin(async move { Ok(std::mem::take(&mut self.missing_queries_queue)) })
     }
+
+    fn mark_node_delta_complete(
+      &mut self,
+      block_number: u64,
+      _sync_lane: SyncLane,
+    ) -> FeederFuture<'_, Result<(), Self::Error>> {
+      Box::pin(async move {
+        self.node_delta_complete_numbers.push(block_number);
+        Ok(())
+      })
+    }
   }
 
   fn block_delta(number: u64, hash_hex: &str, root_hex: &str, nodes: &[&[u8]]) -> BlockDelta {
@@ -417,6 +559,8 @@ mod tests {
       hash_hex: hash_hex.to_string(),
       state_root_hex: root_hex.to_string(),
       changed_trie_nodes_rlp: nodes.iter().map(|n| n.to_vec()).collect(),
+      sync_lane: SyncLane::Historical,
+      node_delta_complete: !nodes.is_empty(),
     }
   }
 
@@ -505,6 +649,34 @@ mod tests {
     let (source, sink) = client.into_parts();
     assert_eq!(sink.submitted_nodes, vec!["0x0102".to_string(), "0x03".to_string()]);
     assert_eq!(source.seen_missing_queries.len(), 2);
+  }
+
+  #[tokio::test]
+  async fn backfill_missing_nodes_publishes_discovered_roots() {
+    let q1 = MissingProofQuery {
+      address: "0x1111111111111111111111111111111111111111".to_string(),
+      storage_keys: vec!["0x01".to_string()],
+      block: MissingBlockId::Number(12),
+    };
+    let source = FakeRethSource::default().with_missing_query_backfills(vec![(
+      q1.clone(),
+      MissingProofBackfill {
+        nodes_rlp: vec![vec![0x01u8]],
+        root_by_number: Some((12, "0xaa".to_string())),
+        root_by_hash: Some(("0xblock".to_string(), "0xaa".to_string())),
+      },
+    )]);
+    let sink = FakeSink::default();
+    let mut client = RethSyncClient::new(source, sink, false);
+
+    let result = client.backfill_missing_nodes(vec![q1]).await.unwrap();
+
+    assert_eq!(result.published, 1);
+    assert_eq!(result.unresolved_queries, 0);
+    let (_, sink) = client.into_parts();
+    assert_eq!(sink.submitted_nodes, vec!["0x01".to_string()]);
+    assert_eq!(sink.roots_by_hash, vec![("0xblock".to_string(), "0xaa".to_string())]);
+    assert_eq!(sink.roots_by_number, vec![(12, "0xaa".to_string())]);
   }
 
   #[tokio::test]

@@ -3,6 +3,7 @@
 #[macro_use]
 extern crate rostl_primitives;
 
+pub mod attestation;
 pub mod authentication;
 pub mod frontend;
 pub mod oblivious_node;
@@ -24,6 +25,7 @@ use state::SharedState;
 struct RuntimeArgs {
   admin_api_key: String,
   leaky_error_recovery: bool,
+  listen_addr: String,
 }
 
 #[tokio::main]
@@ -59,7 +61,11 @@ async fn main() -> Result<()> {
   });
 
   // start rpc
-  frontend::start_rpc(shared).await?;
+  let (handle, addr) = frontend::start_rpc_server(shared, &args.listen_addr).await?;
+  info!("Server listening on {}", addr);
+  info!("Public endpoint: http://{}/{{api_key}}/json_rpc", addr);
+  info!("Admin endpoint: http://{}/{{admin_api_key}}/admin", addr);
+  handle.stopped().await;
   Ok(())
 }
 
@@ -67,6 +73,7 @@ fn parse_runtime_args() -> Result<RuntimeArgs> {
   let mut args = std::env::args().skip(1);
   let mut admin_api_key: Option<String> = None;
   let mut leaky_error_recovery = false;
+  let mut listen_addr = "127.0.0.1:8545".to_string();
 
   while let Some(arg) = args.next() {
     match arg.as_str() {
@@ -80,6 +87,9 @@ fn parse_runtime_args() -> Result<RuntimeArgs> {
       "--leaky-error-recovery" => {
         leaky_error_recovery = true;
       }
+      "--listen-addr" => {
+        listen_addr = args.next().ok_or_else(|| anyhow!("missing value for --listen-addr"))?;
+      }
       _ => return Err(anyhow!("unknown argument: {}", arg)),
     }
   }
@@ -87,5 +97,6 @@ fn parse_runtime_args() -> Result<RuntimeArgs> {
   Ok(RuntimeArgs {
     admin_api_key: admin_api_key.ok_or_else(|| anyhow!("missing --admin-api-key <key>"))?,
     leaky_error_recovery,
+    listen_addr,
   })
 }

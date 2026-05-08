@@ -7,3 +7,8 @@ target/
 .vscode
 lcov.info
 README.crate.md
+deploy/phala/.env.cvm
+deploy/phala/image-ref.env
+deploy/phala/.env.local
+deploy/phala/.env.app
+deploy/phala/.env.registry

@@ -664,6 +664,93 @@ async fn integration_rpc_admin_get_metrics_reports_counters() {
 }
 
 #[tokio::test]
+async fn integration_rpc_admin_get_sync_status_reports_latest_root() {
+  let (srv, _state) = TestServer::start(1 << 10).await;
+
+  let first_root = B256([0x11; 32]).to_hex();
+  let (status, body) =
+    send_rpc_request(&srv.url, "admin_set_root", json!([3, first_root]), 2101).await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(rpc.error.is_none(), "admin_set_root should succeed");
+
+  let older_root = B256([0x22; 32]).to_hex();
+  let (status, body) =
+    send_rpc_request(&srv.url, "admin_set_root", json!([2, older_root]), 2102).await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(rpc.error.is_none(), "older admin_set_root should succeed");
+
+  let (status, body) = send_rpc_request(&srv.url, "admin_get_sync_status", json!([]), 2103).await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(rpc.error.is_none(), "admin_get_sync_status should succeed");
+  let status = rpc.result.as_ref().expect("missing sync status");
+  let expected_root = B256([0x11; 32]).to_hex();
+  assert_eq!(status.get("latest_root_number").and_then(|v| v.as_u64()), Some(3));
+  assert_eq!(status.get("latest_root").and_then(|v| v.as_str()), Some(expected_root.as_str()));
+  assert_eq!(status.get("historical_root_number"), Some(&serde_json::Value::Null));
+  assert_eq!(status.get("live_root_number"), Some(&serde_json::Value::Null));
+  assert_eq!(status.get("latest_node_delta_number"), Some(&serde_json::Value::Null));
+  assert_eq!(status.get("historical_node_delta_number"), Some(&serde_json::Value::Null));
+  assert_eq!(status.get("live_node_delta_number"), Some(&serde_json::Value::Null));
+
+  let batch_root = B256([0x33; 32]).to_hex();
+  let batch_params = json!([
+    [
+      [4, B256([0x44; 32]).to_hex(), B256([0x55; 32]).to_hex()],
+      [5, B256([0x66; 32]).to_hex(), batch_root]
+    ],
+    true,
+    "historical"
+  ]);
+  let (status_code, body) =
+    send_rpc_request(&srv.url, "admin_apply_root_batch", batch_params, 2104).await;
+  assert!(status_code.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(rpc.error.is_none(), "admin_apply_root_batch should succeed");
+
+  let (status_code, body) =
+    send_rpc_request(&srv.url, "admin_get_sync_status", json!([]), 2105).await;
+  assert!(status_code.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(rpc.error.is_none(), "admin_get_sync_status should succeed");
+  let status = rpc.result.as_ref().expect("missing sync status");
+  assert_eq!(status.get("latest_root_number").and_then(|v| v.as_u64()), Some(5));
+  assert_eq!(status.get("historical_root_number").and_then(|v| v.as_u64()), Some(5));
+  assert_eq!(status.get("historical_root_lag_to_latest").and_then(|v| v.as_u64()), Some(0));
+  assert_eq!(status.get("live_root_lag_to_latest"), Some(&serde_json::Value::Null));
+  assert_eq!(status.get("latest_node_lag_to_latest_root"), Some(&serde_json::Value::Null));
+
+  let (status_code, body) =
+    send_rpc_request(&srv.url, "admin_mark_node_delta_complete", json!([2]), 2106).await;
+  assert!(status_code.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(rpc.error.is_none(), "admin_mark_node_delta_complete should succeed");
+
+  let (status_code, body) =
+    send_rpc_request(&srv.url, "admin_get_sync_status", json!([]), 2107).await;
+  assert!(status_code.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(rpc.error.is_none(), "admin_get_sync_status should succeed");
+  let status = rpc.result.as_ref().expect("missing sync status");
+  assert_eq!(status.get("latest_node_delta_number").and_then(|v| v.as_u64()), Some(2));
+  assert_eq!(status.get("historical_node_delta_number").and_then(|v| v.as_u64()), Some(2));
+  assert_eq!(status.get("latest_node_lag_to_latest_root").and_then(|v| v.as_u64()), Some(3));
+  assert_eq!(
+    status.get("historical_node_lag_to_historical_root").and_then(|v| v.as_u64()),
+    Some(3)
+  );
+  assert!(status.get("latest_root_number_meaning").and_then(|v| v.as_str()).is_some());
+  assert!(status.get("latest_node_delta_number_meaning").and_then(|v| v.as_str()).is_some());
+  assert!(status.get("historical_root_number_meaning").and_then(|v| v.as_str()).is_some());
+  assert!(status.get("historical_node_delta_number_meaning").and_then(|v| v.as_str()).is_some());
+  assert!(status.get("historical_root_lag_to_latest_meaning").and_then(|v| v.as_str()).is_some());
+  assert!(status.get("live_root_lag_to_latest_meaning").and_then(|v| v.as_str()).is_some());
+  assert!(status.get("latest_node_lag_to_latest_root_meaning").and_then(|v| v.as_str()).is_some());
+}
+
+#[tokio::test]
 async fn integration_rpc_admin_apply_block_delta_sets_roots() {
   let (srv, state) = TestServer::start(1 << 10).await;
 
@@ -686,6 +773,46 @@ async fn integration_rpc_admin_apply_block_delta_sets_roots() {
   let hash_b256 = B256::from_hex(&block_hash).unwrap();
   assert_eq!(state.get_root_by_hash(hash_b256).await, Some(root_b256));
   assert_eq!(state.get_root(block_number).await, Some(root_b256));
+}
+
+#[tokio::test]
+async fn integration_rpc_admin_apply_block_delta_drains_bulk_node_inserts() {
+  let (srv, state) = TestServer::start(1 << 10).await;
+
+  let block_number = 42u64;
+  let block_hash = B256([0x44; 32]);
+  let root = B256([0x55; 32]);
+  let mut nodes: Vec<String> = ACCOUNT_NODES.iter().map(|node| format!("0x{}", node)).collect();
+  nodes.extend(PROOF_NODES.iter().map(|node| format!("0x{}", node)));
+  let params = json!([block_number, block_hash.to_hex(), root.to_hex(), nodes, true]);
+
+  let (status, body) = send_rpc_request(&srv.url, "admin_apply_block_delta", params, 2060).await;
+  assert!(status.is_success());
+  let rpc = parse_rpc_response(&body).expect("invalid RPC response");
+  assert!(rpc.error.is_none(), "bulk admin_apply_block_delta should succeed: {}", body);
+  assert_eq!(state.get_root_by_hash(block_hash).await, Some(root));
+  assert_eq!(state.get_root(block_number).await, Some(root));
+}
+
+#[tokio::test]
+async fn integration_routed_rpc_health_and_attestation_validation() {
+  let admin_key = "olabs-admin-health000000000000000000000";
+  let (srv, _state) = RoutedTestServer::start(1 << 10, admin_key).await;
+  let client = reqwest::Client::new();
+
+  let health =
+    client.get(format!("{}/healthz", srv.base_url)).send().await.expect("health request failed");
+  assert_eq!(health.status(), reqwest::StatusCode::OK);
+  assert_eq!(health.text().await.unwrap(), "ok\n");
+
+  let invalid_report_data = client
+    .get(format!("{}/attestation?report_data=zz", srv.base_url))
+    .send()
+    .await
+    .expect("attestation request failed");
+  assert_eq!(invalid_report_data.status(), reqwest::StatusCode::BAD_REQUEST);
+  let body = invalid_report_data.text().await.unwrap();
+  assert!(body.contains("report_data must be hex"));
 }
 
 #[tokio::test]

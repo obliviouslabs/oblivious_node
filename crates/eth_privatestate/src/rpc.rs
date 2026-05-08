@@ -159,33 +159,34 @@ async fn handle_proof_result(
 async fn resolve_root_for_selector(
   state: &SharedState,
   block_selector: BlockSelector,
-) -> Result<Option<(B256, MissingBlockId)>, ErrorObjectOwned> {
+) -> Result<(Option<B256>, Option<MissingBlockId>), ErrorObjectOwned> {
   match block_selector {
     BlockSelector::Number(block_num) => {
-      Ok(state.get_root(block_num).await.map(|root| (root, MissingBlockId::Number(block_num))))
+      Ok((state.get_root(block_num).await, Some(MissingBlockId::Number(block_num))))
     }
     BlockSelector::BlockHash(selector) => {
       if selector.require_canonical == Some(true) {
         return Err(unsupported_error("requireCanonical=true is unsupported"));
       }
       let block_hash = decode_b256_hex(&selector.block_hash, "block hash")?;
-      Ok(state.get_root_by_hash(block_hash).await.map(|root| {
-        (
-          root,
-          MissingBlockId::BlockHash(MissingBlockHashSelector {
-            block_hash: block_hash.to_hex(),
-            require_canonical: false,
-          }),
-        )
-      }))
+      Ok((
+        state.get_root_by_hash(block_hash).await,
+        Some(MissingBlockId::BlockHash(MissingBlockHashSelector {
+          block_hash: block_hash.to_hex(),
+          require_canonical: false,
+        })),
+      ))
     }
     BlockSelector::Tag(tag) => match tag.as_str() {
-      "latest" => Ok(
-        state
-          .get_latest_root_with_number()
-          .await
-          .map(|(number, root)| (root, MissingBlockId::Number(number))),
-      ),
+      "latest" => {
+        let latest = state.get_latest_root_with_number().await;
+        Ok((latest.map(|(_, root)| root), latest.map(|(number, _)| MissingBlockId::Number(number))))
+      }
+      quantity if quantity.starts_with("0x") => {
+        let block_num = u64::from_str_radix(&quantity[2..], 16)
+          .map_err(|_| unsupported_error("Unsupported block tag"))?;
+        Ok((state.get_root(block_num).await, Some(MissingBlockId::Number(block_num))))
+      }
       _ => Err(unsupported_error("Unsupported block tag")),
     },
   }
@@ -238,12 +239,22 @@ pub async fn eth_get_proof_handler(
   }
 
   // get root for the requested block selector
-  let root_with_selector = resolve_root_for_selector(state.as_ref(), block_selector).await?;
-  let (root, missing_block) = root_with_selector.ok_or_else(data_non_availability_error)?;
+  let (root, missing_block) = resolve_root_for_selector(state.as_ref(), block_selector).await?;
+  let missing_block = match missing_block {
+    Some(block) => block,
+    None => return Err(data_non_availability_error()),
+  };
   let missing_query = MissingProofQuery {
     address: address_hex,
     storage_keys: missing_storage_keys,
     block: missing_block,
+  };
+  let root = match root {
+    Some(root) => root,
+    None => {
+      state.record_missing_proof_query(missing_query).await;
+      return Err(data_non_availability_error());
+    }
   };
 
   // generate account proof; if missing -> error
@@ -326,6 +337,27 @@ mod tests {
     let err = res.err().unwrap();
     let msg = format!("{:?}", err);
     assert!(msg.contains("Failed due to data non availability"));
+  }
+
+  #[tokio::test]
+  async fn test_missing_root_records_backfill_query_when_recovery_enabled() {
+    let state = Arc::new(SharedState::new_with_admin_key_and_leaky_error_recovery(
+      1 << 10,
+      "olabs-admin-test-key-000000000000".to_string(),
+      true,
+    ));
+    let params = GetProofParams(
+      "0x0000000000000000000000000000000000000000".to_string(),
+      vec!["0x0000000000000000000000000000000000000000000000000000000000000000".to_string()],
+      BlockSelector::Number(42),
+    );
+    let res = eth_get_proof_handler(params, state.clone()).await;
+    assert!(res.is_err());
+
+    let missing = state.take_missing_proof_queries().await;
+    assert_eq!(missing.len(), 1);
+    assert_eq!(missing[0].block, MissingBlockId::Number(42));
+    assert_eq!(missing[0].storage_keys.len(), 1);
   }
 
   #[tokio::test]
@@ -473,6 +505,21 @@ mod tests {
     let err = res.err().unwrap();
     assert_eq!(err.code(), -32001);
     assert!(err.message().contains("data non availability"));
+  }
+
+  #[tokio::test]
+  async fn test_hex_quantity_block_selector_resolves_numbered_root() {
+    let state = Arc::new(SharedState::new(1 << 10));
+    let root = B256([0x33; 32]);
+    state.set_root(1_000_000, root).await;
+
+    let (resolved_root, missing_block) =
+      resolve_root_for_selector(state.as_ref(), BlockSelector::Tag("0xf4240".to_string()))
+        .await
+        .unwrap();
+
+    assert_eq!(resolved_root, Some(root));
+    assert_eq!(missing_block, Some(MissingBlockId::Number(1_000_000)));
   }
 
   #[tokio::test]

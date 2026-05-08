@@ -8,7 +8,7 @@ use eth_privatestate::state::MissingProofQuery;
 use reqwest::{Client, StatusCode, Url};
 use serde_json::{json, Value};
 
-use crate::{AdminSink, BlockDelta, FeederFuture};
+use crate::{AdminSink, BlockDelta, FeederFuture, SyncLane};
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_RETRY_ATTEMPTS: u32 = 3;
@@ -161,6 +161,8 @@ impl AdminSink for HttpAdminSink {
     let block_number = block.number;
     let block_hash_hex = block.hash_hex.clone();
     let state_root_hex = block.state_root_hex.clone();
+    let node_delta_complete = block.node_delta_complete;
+    let sync_lane = block.sync_lane;
     let node_hexes: Vec<String> =
       block.changed_trie_nodes_rlp.iter().map(|node| format!("0x{}", hex::encode(node))).collect();
 
@@ -168,7 +170,79 @@ impl AdminSink for HttpAdminSink {
       self
         .call_bool_method(
           "admin_apply_block_delta",
-          json!([block_number, block_hash_hex, state_root_hex, node_hexes, publish_root_by_number]),
+          json!([
+            block_number,
+            block_hash_hex,
+            state_root_hex,
+            node_hexes,
+            publish_root_by_number,
+            sync_lane.as_str()
+          ]),
+        )
+        .await?;
+      if node_delta_complete {
+        self
+          .call_bool_method(
+            "admin_mark_node_delta_complete",
+            json!([block_number, sync_lane.as_str()]),
+          )
+          .await?;
+      }
+      Ok(())
+    })
+  }
+
+  fn publish_block_deltas<'a>(
+    &'a mut self,
+    blocks: &'a [BlockDelta],
+    publish_root_by_number: bool,
+  ) -> FeederFuture<'a, Result<(), Self::Error>> {
+    if blocks.is_empty() {
+      return Box::pin(async move { Ok(()) });
+    }
+
+    let roots_only = blocks
+      .iter()
+      .all(|block| block.changed_trie_nodes_rlp.is_empty() && !block.node_delta_complete);
+    let single_lane = blocks
+      .first()
+      .map(|first| blocks.iter().all(|block| block.sync_lane == first.sync_lane))
+      .unwrap_or(true);
+
+    if roots_only && single_lane {
+      let sync_lane = blocks.first().map(|block| block.sync_lane).unwrap_or(SyncLane::Historical);
+      let roots: Vec<Value> = blocks
+        .iter()
+        .map(|block| json!([block.number, block.hash_hex, block.state_root_hex]))
+        .collect();
+      return Box::pin(async move {
+        self
+          .call_bool_method(
+            "admin_apply_root_batch",
+            json!([roots, publish_root_by_number, sync_lane.as_str()]),
+          )
+          .await
+      });
+    }
+
+    Box::pin(async move {
+      for block in blocks {
+        self.publish_block_delta(block, publish_root_by_number).await?;
+      }
+      Ok(())
+    })
+  }
+
+  fn mark_node_delta_complete(
+    &mut self,
+    block_number: u64,
+    sync_lane: SyncLane,
+  ) -> FeederFuture<'_, Result<(), Self::Error>> {
+    Box::pin(async move {
+      self
+        .call_bool_method(
+          "admin_mark_node_delta_complete",
+          json!([block_number, sync_lane.as_str()]),
         )
         .await
     })

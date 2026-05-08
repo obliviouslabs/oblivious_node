@@ -1,0 +1,3 @@
+[submodule "external/tdx_easy_https"]
+	path = external/tdx_easy_https
+	url = https://github.com/obliviouslabs/tdx_easy_https
