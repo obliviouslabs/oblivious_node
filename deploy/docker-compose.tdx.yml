@@ -1,0 +1,182 @@
+volumes:
+  acme:
+  reth-data:
+  lighthouse-data:
+  jwt:
+
+networks:
+  internet:
+    internal: false
+  proxy:
+    internal: true
+
+services:
+  traefik:
+    image: traefik:v3.1
+    restart: unless-stopped
+    command:
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.http.redirections.entryPoint.to=websecure
+      - --entrypoints.web.http.redirections.entryPoint.scheme=https
+      - --certificatesresolvers.le.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.le.acme.storage=/acme/acme.json
+      - --certificatesresolvers.le.acme.httpchallenge=true
+      - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
+      - --api=false
+      - --accesslog=true
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - acme:/acme
+    networks:
+      - internet
+      - proxy
+
+  attestd:
+    build:
+      context: ../external/tdx_easy_https/attestd
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.attestd.rule=Host(`${SERVER_DOMAIN}`) && PathPrefix(`/attestd/`)
+      - traefik.http.routers.attestd.priority=9999
+      - traefik.http.routers.attestd.entrypoints=websecure
+      - traefik.http.routers.attestd.tls.certresolver=le
+      - traefik.http.services.attestd.loadbalancer.server.port=80
+      - traefik.http.middlewares.attestd-strip.stripprefix.prefixes=/attestd
+      - traefik.http.routers.attestd.middlewares=attestd-strip
+    volumes:
+      - acme:/acme:ro
+      - /dev/tdx-guest:/dev/tdx-guest
+    networks:
+      - proxy
+
+  reth:
+    profiles: ["sepolia"]
+    image: ghcr.io/paradigmxyz/reth:latest
+    restart: unless-stopped
+    depends_on:
+      jwt_init:
+        condition: service_completed_successfully
+    command:
+      - node
+      - --chain
+      - ${ETH_NETWORK:-sepolia}
+      - --http
+      - --http.addr
+      - 0.0.0.0
+      - --http.port
+      - "8546"
+      - --authrpc.addr
+      - 0.0.0.0
+      - --authrpc.port
+      - "8551"
+      - --authrpc.jwtsecret
+      - /jwt/jwt.hex
+      - --http.api
+      - eth,debug,net,web3,admin,reth,txpool,trace,rpc
+      - --rpc.eth-proof-window
+      - "100000"
+      - --ipcdisable
+    ports:
+      - "30303:30303/tcp"
+      - "30303:30303/udp"
+    volumes:
+      - reth-data:/root/.local/share/reth
+      - jwt:/jwt
+    networks:
+      - proxy
+      - internet
+
+  jwt_init:
+    profiles: ["sepolia"]
+    image: alpine:3.20
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        if [ ! -s /jwt/jwt.hex ]; then
+          head -c 32 /dev/urandom | xxd -p -c 64 > /jwt/jwt.hex
+        fi
+    volumes:
+      - jwt:/jwt
+    networks:
+      - proxy
+
+  lighthouse:
+    profiles: ["sepolia"]
+    image: sigp/lighthouse:latest
+    restart: unless-stopped
+    depends_on:
+      reth:
+        condition: service_started
+      jwt_init:
+        condition: service_completed_successfully
+    entrypoint: ["lighthouse"]
+    command:
+      - bn
+      - --network
+      - ${ETH_NETWORK:-sepolia}
+      - --execution-endpoint
+      - http://reth:8551
+      - --execution-jwt
+      - /jwt/jwt.hex
+      - --checkpoint-sync-url
+      - ${LIGHTHOUSE_CHECKPOINT_SYNC_URL:-https://checkpoint-sync.sepolia.ethpandaops.io}
+    volumes:
+      - lighthouse-data:/root/.lighthouse
+      - jwt:/jwt
+    networks:
+      - proxy
+      - internet
+
+  eth_privatestate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.oblivious_node
+    restart: unless-stopped
+    command:
+      - eth_privatestate
+      - --admin-api-key
+      - ${ADMIN_API_KEY}
+      - --listen-addr
+      - 0.0.0.0:8545
+      - --leaky-error-recovery
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.privatestate.rule=Host(`${SERVER_DOMAIN}`)
+      - traefik.http.routers.privatestate.priority=1
+      - traefik.http.routers.privatestate.entrypoints=websecure
+      - traefik.http.routers.privatestate.tls.certresolver=le
+      - traefik.http.services.privatestate.loadbalancer.server.port=8545
+    networks:
+      - proxy
+
+  eth_sync_feeder:
+    profiles: ["sepolia"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.oblivious_node
+    restart: unless-stopped
+    depends_on:
+      - eth_privatestate
+      - reth
+    command:
+      - eth_sync_feeder
+      - --reth-rpc-url
+      - ${RETH_RPC_URL:-http://reth:8546}
+      - --admin-base-url
+      - http://eth_privatestate:8545
+      - --admin-api-key
+      - ${ADMIN_API_KEY}
+      - --initial-sync-start-block
+      - ${INITIAL_SYNC_START_BLOCK:-1}
+      - --node-sync-mode
+      - ${NODE_SYNC_MODE:-roots-and-witness}
+    networks:
+      - proxy

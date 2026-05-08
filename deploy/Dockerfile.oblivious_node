@@ -1,0 +1,16 @@
+FROM rust:1.88-bookworm AS builder
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN cargo build --release -p eth_privatestate -p eth_sync_feeder
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/eth_privatestate /usr/local/bin/eth_privatestate
+COPY --from=builder /app/target/release/eth_sync_feeder /usr/local/bin/eth_sync_feeder
+

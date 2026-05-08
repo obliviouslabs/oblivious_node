@@ -1,0 +1,14 @@
+[package]
+name = "tdx_quote_verifier"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "AGPL-3.0-or-later"
+
+[workspace]
+
+[dependencies]
+dcap-qvl = "0.3.12"
+hex = "0.4"
+serde_json = "1.0"
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread"] }

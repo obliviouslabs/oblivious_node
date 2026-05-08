@@ -1,0 +1,107 @@
+volumes:
+  reth-data:
+  lighthouse-data:
+  jwt:
+
+services:
+  jwt_init:
+    image: ${JWT_INIT_IMAGE:-alpine:3.20}
+    restart: "no"
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        if [ ! -s /jwt/jwt.hex ]; then
+          head -c 32 /dev/urandom | xxd -p -c 64 > /jwt/jwt.hex
+        fi
+    volumes:
+      - jwt:/jwt
+
+  reth:
+    image: ${RETH_IMAGE}
+    restart: unless-stopped
+    depends_on:
+      jwt_init:
+        condition: service_completed_successfully
+    command:
+      - node
+      - --chain
+      - ${ETH_NETWORK:-sepolia}
+      - --http
+      - --http.addr
+      - 0.0.0.0
+      - --http.port
+      - "8546"
+      - --authrpc.addr
+      - 0.0.0.0
+      - --authrpc.port
+      - "8551"
+      - --authrpc.jwtsecret
+      - /jwt/jwt.hex
+      - --http.api
+      - eth,debug,net,web3,admin,reth,txpool,trace,rpc
+      - --rpc.eth-proof-window
+      - "100000"
+      - --ipcdisable
+    volumes:
+      - reth-data:/root/.local/share/reth
+      - jwt:/jwt
+
+  lighthouse:
+    image: ${LIGHTHOUSE_IMAGE}
+    restart: unless-stopped
+    depends_on:
+      reth:
+        condition: service_started
+      jwt_init:
+        condition: service_completed_successfully
+    entrypoint: ["lighthouse"]
+    command:
+      - bn
+      - --network
+      - ${ETH_NETWORK:-sepolia}
+      - --execution-endpoint
+      - http://reth:8551
+      - --execution-jwt
+      - /jwt/jwt.hex
+      - --checkpoint-sync-url
+      - ${LIGHTHOUSE_CHECKPOINT_SYNC_URL:-https://checkpoint-sync.sepolia.ethpandaops.io}
+    volumes:
+      - lighthouse-data:/root/.lighthouse
+      - jwt:/jwt
+
+  eth_privatestate:
+    image: ${OBLIVIOUS_NODE_IMAGE}
+    restart: unless-stopped
+    command:
+      - eth_privatestate
+      - --admin-api-key
+      - ${ADMIN_API_KEY}
+      - --listen-addr
+      - 0.0.0.0:8545
+      - --leaky-error-recovery
+    environment:
+      - DSTACK_SOCKET_PATH=${DSTACK_SOCKET_PATH:-/var/run/dstack.sock}
+    ports:
+      - "8545:8545"
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+
+  eth_sync_feeder:
+    image: ${OBLIVIOUS_NODE_IMAGE}
+    restart: unless-stopped
+    depends_on:
+      - eth_privatestate
+      - reth
+    command:
+      - eth_sync_feeder
+      - --reth-rpc-url
+      - ${RETH_RPC_URL:-http://reth:8546}
+      - --admin-base-url
+      - http://eth_privatestate:8545
+      - --admin-api-key
+      - ${ADMIN_API_KEY}
+      - --initial-sync-start-block
+      - ${INITIAL_SYNC_START_BLOCK:-1}
+      - --node-sync-mode
+      - ${NODE_SYNC_MODE:-roots-and-witness}
