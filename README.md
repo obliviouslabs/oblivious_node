@@ -9,6 +9,7 @@
 - *Oblivious* = instruction trace and memory access trace are independent from private input data. 
 
 - *oblivious + [doit](https://www.intel.com/content/www/us/en/developer/articles/technical/software-security-guidance/best-practices/data-operand-independent-timing-isa-guidance.html) ==> execution time independent of private-data *
+- Current tradeoff: root lookup uses direct array/map access for speed and leaks the requested block selector. Trie/proof node traversal is the ORAM-backed oblivious part.
 
 - Clients can get proofs of ethereum state, without the server operator being able to learn which account addresses and storage locations are being queried. 
 
@@ -18,6 +19,7 @@
 - Run server: `cargo run -p eth_privatestate --release -- --admin-api-key <at-least-32-char-key>`
   - Optional: `--leaky-error-recovery` (enables missing-proof queue/backfill hook; leaks block selector + duplicate status)
   - Optional: `--listen-addr <host:port>` (default `127.0.0.1:8545`)
+  - Optional: `--root-map-capacity <n>` / `ROOT_MAP_CAPACITY` and `--node-map-capacity <n>` / `NODE_MAP_CAPACITY`
 
 ## Docker Deployment (with `tdx_easy_https`)
 This repo includes `tdx_easy_https` as a nested repo at `external/tdx_easy_https` and a
@@ -61,6 +63,7 @@ Notes:
 - Set `ETH_NETWORK` in `deploy/.env.tdx` to choose the network (default `sepolia`).
 - Set `LIGHTHOUSE_CHECKPOINT_SYNC_URL` for that network (example provided for Sepolia) when using `--profile sepolia`.
 - Public-testnet compose stacks start the public JSON-RPC endpoint immediately, then run root sync, witness-node sync, live sync, and missing-node backfill in parallel. Keep reth in archive/full-history mode so historical request backfills have the data they need. By default `INITIAL_SYNC_START_BLOCK=1` fetches all historical block roots quickly, while `NODE_SYNC_MODE=roots-and-witness` keeps fetching old and new witness nodes in the background with bounded parallel `debug_executionWitness` calls. `roots-only` is available when you only want roots plus request-driven backfill.
+- For current Sepolia, set `ROOT_MAP_CAPACITY` above the chain height, for example `12000000`. A `NODE_MAP_CAPACITY` of `16777216` is not about 1 GB: the raw `ObliviousNode` values alone are roughly 9.4 GB before keys, buckets, ORAM storage, and position-map overhead, so use a larger-memory CVM for that setting.
 - For Phala deployments (image-only compose + encrypted secrets + client-side TDX attestation verification), use `phase1.md` and `deploy/phala/README.md`.
 
 Phala dstack deployments expose extra verifier endpoints from `eth_privatestate`:
@@ -95,6 +98,8 @@ Optional server flag:
 - `--leaky-error-recovery`: enable `admin_take_missing_nodes` backfill queue.
   This mode is intentionally leaky (block selector + duplicate status in instruction/memory trace).
   Default is disabled.
+- `--root-map-capacity <n>`: capacity for both block-number and block-hash root maps. Defaults to `1048576`.
+- `--node-map-capacity <n>`: capacity for cached trie nodes. Defaults to `1024`.
 
 ### 2) Start reth node
 In a second terminal:
@@ -209,6 +214,7 @@ curl -s -X POST "$OBLIV_RPC" -H 'Content-Type: application/json' --data "$PAYLOA
 - Goal: make instruction and memory access patterns independent of clients' private inputs so proofs can be generated in constant time and with reduced leakage inside of TEEs.
 - Core types: `ObliviousNode` and oblivious helpers (branchless json and hex helpers, `oblivious_memcpy`, `oblivious_shift`) live in `crates/eth_privatestate/src/` (`oblivious_node.rs`, `trie.rs`, `rpc.rs`).
 - Core logic: `ObliviousNode::traverse_oblivious` and `trie::generate_proof`.
+- Root lookup tradeoff: block-number and block-hash root maps are deliberately direct for now, so the requested block selector is visible to the host. The private address/storage-key traversal still goes through the ORAM-backed node map.
 - Missing-node cache tradeoff: enabling `--leaky-error-recovery` allows feeder backfill, but leaks block selector + duplicate status and stores query-derived identifiers.
 - Status: PoC — some helpers are marked `UNDONE()` and there are TODOs to move core oblivious primitives into [obliviouslabs/rostl](https://github.com/obliviouslabs/rostl).
 

@@ -556,7 +556,7 @@ async fn integration_rpc_eth_getproof_with_storage_key() {
           found_expected_key = true;
           let v = entry_obj.get("value").and_then(|v| v.as_str()).expect("value not string");
           assert_eq!(
-            v, "0x94c6cde7c39eb2f0f0095f41570af89efc2c1ea828",
+            v, "0xc6cde7c39eb2f0f0095f41570af89efc2c1ea828",
             "storage value should match decoded payload bytes"
           );
         }

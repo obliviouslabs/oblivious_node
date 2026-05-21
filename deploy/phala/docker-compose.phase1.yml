@@ -9,6 +9,10 @@ services:
       - ${ADMIN_API_KEY}
       - --listen-addr
       - 0.0.0.0:8545
+      - --root-map-capacity
+      - ${ROOT_MAP_CAPACITY:-1048576}
+      - --node-map-capacity
+      - ${NODE_MAP_CAPACITY:-1024}
       - --leaky-error-recovery
     environment:
       - DSTACK_SOCKET_PATH=${DSTACK_SOCKET_PATH:-/var/run/dstack.sock}

@@ -250,6 +250,73 @@ pub fn bytes_to_hex_oblivious_hidden_size_quoted(bytes: &[u8], size: usize) -> S
   unsafe { String::from_utf8_unchecked(out) }
 }
 
+/// Encode a big-endian integer as an EIP-1474 `Quantity` JSON string while
+/// keeping the raw JSON token fixed-width. The significant `"0x..."` string is
+/// right-aligned and the unused prefix is JSON whitespace, so serde clients see
+/// a canonical quantity without requiring data-dependent string trimming.
+pub fn bytes_to_quantity_oblivious_quoted_left_padded(bytes: &[u8], size: usize) -> String {
+  let mut bounded_size = size;
+  bounded_size.cmov(&bytes.len(), size > bytes.len());
+
+  let max_digits = bytes.len() * 2;
+  let total_len = (4 + max_digits).max(5);
+
+  let mut first_nonzero = bytes.len();
+  let mut found = false;
+  for (i, byte) in bytes.iter().enumerate() {
+    let is_first = (i < bounded_size) & (*byte != 0) & !found;
+    first_nonzero.cmov(&i, is_first);
+    found |= (i < bounded_size) & (*byte != 0);
+  }
+
+  let mut first_byte = 0u8;
+  for (i, byte) in bytes.iter().enumerate() {
+    first_byte.cmov(byte, found & (i == first_nonzero));
+  }
+
+  let high_nibble_is_zero = first_byte < 0x10;
+  let mut canonical_start_digit = first_nonzero * 2;
+  canonical_start_digit = canonical_start_digit.wrapping_add(high_nibble_is_zero as usize);
+  canonical_start_digit.cmov(&0, !found);
+
+  let mut digit_count = 1usize;
+  let mut nonzero_digit_count = bounded_size.wrapping_sub(first_nonzero).wrapping_mul(2);
+  nonzero_digit_count = nonzero_digit_count.wrapping_sub(high_nibble_is_zero as usize);
+  digit_count.cmov(&nonzero_digit_count, found);
+
+  let open_quote = total_len - (digit_count + 4);
+  let digit_start = open_quote + 3;
+  let last = total_len - 1;
+  let source_digit_end = bounded_size * 2;
+
+  let mut out = vec![b' '; total_len];
+  for (pos, out_byte) in out.iter_mut().enumerate() {
+    let mut ch = b' ';
+    ch.cmov(&b'"', pos == open_quote);
+    ch.cmov(&b'0', pos == open_quote + 1);
+    ch.cmov(&b'x', pos == open_quote + 2);
+    ch.cmov(&b'"', pos == last);
+
+    let target_digit = pos.wrapping_sub(digit_start);
+    let is_digit_pos = target_digit < digit_count;
+    let mut digit = b'0';
+    for source_digit in 0..max_digits {
+      let byte = bytes[source_digit / 2];
+      let nibble = if source_digit % 2 == 0 { byte >> 4 } else { byte & 0x0f };
+      let source_target_digit = source_digit.wrapping_sub(canonical_start_digit);
+      let is_source = found
+        & is_digit_pos
+        & (source_digit < source_digit_end)
+        & (source_target_digit == target_digit);
+      digit.cmov(&nibble_to_hex_oblivious(nibble), is_source);
+    }
+    ch.cmov(&digit, is_digit_pos);
+    *out_byte = ch;
+  }
+
+  unsafe { String::from_utf8_unchecked(out) }
+}
+
 #[cfg(test)]
 #[allow(clippy::all)]
 mod tests {
@@ -341,5 +408,30 @@ mod tests {
     // invalid nibble should set is_some=false but still produce a value
     let invalid_h = H160::from_hex("0xzz0102030405060708090a0b0c0d0e0f10111213");
     assert!(!invalid_h.is_some(), "invalid hex should be marked none");
+  }
+
+  #[test]
+  fn test_quantity_encoder_left_pads_raw_json_and_canonicalizes() {
+    let cases: Vec<(&[u8], usize, &str)> = vec![
+      (&[0, 0, 0], 0, "0x0"),
+      (&[0, 0, 0], 3, "0x0"),
+      (&[0x0f, 0, 0], 1, "0xf"),
+      (&[0, 0x0f, 0], 2, "0xf"),
+      (&[0x12, 0x34, 0], 2, "0x1234"),
+      (&[0x01, 0x23, 0], 2, "0x123"),
+    ];
+
+    let mut out_len = None;
+    for (bytes, size, expected) in cases {
+      let raw = bytes_to_quantity_oblivious_quoted_left_padded(bytes, size);
+      if let Some(len) = out_len {
+        assert_eq!(raw.len(), len, "raw JSON token length should be fixed");
+      } else {
+        out_len = Some(raw.len());
+      }
+      let parsed: String = serde_json::from_str(&raw).expect("valid padded raw JSON string");
+      assert_eq!(parsed, expected);
+      assert_eq!(raw.as_bytes()[raw.len() - 1], b'"', "closing quote should be fixed at end");
+    }
   }
 }

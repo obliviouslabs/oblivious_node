@@ -103,6 +103,18 @@ async fn utility_http_response(
         Err(err) => Some(attestation_error_response(err)),
       }
     }
+    "/attested_tls_cert" => {
+      if request.method() != Method::GET {
+        return Some(text_http_response(
+          405,
+          "Use GET /attested_tls_cert?domain=example.com&challenge=0x...",
+        ));
+      }
+      match attestation::attested_tls_cert_for_query(request.uri().query()).await {
+        Ok(body) => Some(json_http_response(200, &body)),
+        Err(err) => Some(attestation_error_response(err)),
+      }
+    }
     "/info" => {
       if request.method() != Method::GET {
         return Some(text_http_response(405, "Use GET /info"));
@@ -148,7 +160,7 @@ impl Service<HttpRequest<hyper::body::Incoming>> for RoutedHttpService {
         None => {
           return Ok(text_http_response(
             404,
-            "Path must be /{api_key}/json_rpc, /{api_key}/admin, /attestation, /info, or /healthz",
+            "Path must be /{api_key}/json_rpc, /{api_key}/admin, /attestation, /attested_tls_cert, /info, or /healthz",
           ));
         }
       };

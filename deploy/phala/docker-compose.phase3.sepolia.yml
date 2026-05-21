@@ -1,11 +1,30 @@
 volumes:
   reth-data:
   lighthouse-data:
+  cert-data:
   jwt:
 
 services:
+  dstack-ingress:
+    image: dstacktee/dstack-ingress:20250924@sha256:40429d78060ef3066b5f93676bf3ba7c2e9ac47d4648440febfdda558aed4b32
+    restart: unless-stopped
+    depends_on:
+      - eth_privatestate
+    ports:
+      - "443:443"
+    environment:
+      - DOMAIN=rpc.safe-node.com
+      - TARGET_ENDPOINT=http://eth_privatestate:8545
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - GATEWAY_DOMAIN=_.${DSTACK_GATEWAY_DOMAIN}
+      - CERTBOT_EMAIL=${CERTBOT_EMAIL}
+      - SET_CAA=true
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - cert-data:/etc/letsencrypt
+
   jwt_init:
-    image: ${JWT_INIT_IMAGE:-alpine:3.20}
+    image: alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
     restart: "no"
     command:
       - /bin/sh
@@ -18,7 +37,7 @@ services:
       - jwt:/jwt
 
   reth:
-    image: ${RETH_IMAGE}
+    image: ghcr.io/paradigmxyz/reth@sha256:505fca5e87d6411fc7117f29a87e42787ec2eebe8225506e9ddb4759ae2ba5cc
     restart: unless-stopped
     depends_on:
       jwt_init:
@@ -26,7 +45,12 @@ services:
     command:
       - node
       - --chain
-      - ${ETH_NETWORK:-sepolia}
+      - sepolia
+      - --minimal
+      - --db.rocksdb-block-cache-size
+      - 512MB
+      - --engine.cross-block-cache-size
+      - "512"
       - --http
       - --http.addr
       - 0.0.0.0
@@ -48,7 +72,7 @@ services:
       - jwt:/jwt
 
   lighthouse:
-    image: ${LIGHTHOUSE_IMAGE}
+    image: sigp/lighthouse@sha256:44aa773dcf274122c32cc41c4dae7124ed3cab5c267ee82174c6dfd9c688da96
     restart: unless-stopped
     depends_on:
       reth:
@@ -59,19 +83,19 @@ services:
     command:
       - bn
       - --network
-      - ${ETH_NETWORK:-sepolia}
+      - sepolia
       - --execution-endpoint
       - http://reth:8551
       - --execution-jwt
       - /jwt/jwt.hex
       - --checkpoint-sync-url
-      - ${LIGHTHOUSE_CHECKPOINT_SYNC_URL:-https://checkpoint-sync.sepolia.ethpandaops.io}
+      - https://checkpoint-sync.sepolia.ethpandaops.io
     volumes:
       - lighthouse-data:/root/.lighthouse
       - jwt:/jwt
 
   eth_privatestate:
-    image: ${OBLIVIOUS_NODE_IMAGE}
+    image: docker.io/xtrm0/oblivious-node@sha256:75b1aa86d2cebf4dee21feaf72418fe1b97a006b86cd0e2b49d0f81833fafb9f
     restart: unless-stopped
     command:
       - eth_privatestate
@@ -79,16 +103,42 @@ services:
       - ${ADMIN_API_KEY}
       - --listen-addr
       - 0.0.0.0:8545
+      - --root-map-capacity
+      - ${ROOT_MAP_CAPACITY:-16000000}
+      - --node-map-capacity
+      - ${NODE_MAP_CAPACITY:-16777216}
       - --leaky-error-recovery
     environment:
-      - DSTACK_SOCKET_PATH=${DSTACK_SOCKET_PATH:-/var/run/dstack.sock}
+      - DSTACK_SOCKET_PATH=/var/run/dstack.sock
+      - ATTESTED_TLS_CERT_PATH=/etc/letsencrypt/live/rpc.safe-node.com/fullchain.pem
     ports:
       - "8545:8545"
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock
+      - cert-data:/etc/letsencrypt:ro
 
-  eth_sync_feeder:
-    image: ${OBLIVIOUS_NODE_IMAGE}
+  eth_sync_feeder_seed:
+    image: docker.io/xtrm0/oblivious-node@sha256:75b1aa86d2cebf4dee21feaf72418fe1b97a006b86cd0e2b49d0f81833fafb9f
+    restart: unless-stopped
+    depends_on:
+      - eth_privatestate
+    command:
+      - eth_sync_feeder
+      - --reth-rpc-url
+      - ${SEED_RETH_RPC_URL:-https://ethereum-sepolia-rpc.publicnode.com}
+      - --admin-base-url
+      - http://eth_privatestate:8545
+      - --admin-api-key
+      - ${ADMIN_API_KEY}
+      - --initial-sync-start-block
+      - "1"
+      - --initial-sync-end-block
+      - ${INITIAL_SYNC_END_BLOCK:-1000000}
+      - --node-sync-mode
+      - roots-only
+
+  eth_sync_feeder_local:
+    image: docker.io/xtrm0/oblivious-node@sha256:75b1aa86d2cebf4dee21feaf72418fe1b97a006b86cd0e2b49d0f81833fafb9f
     restart: unless-stopped
     depends_on:
       - eth_privatestate
@@ -96,12 +146,15 @@ services:
     command:
       - eth_sync_feeder
       - --reth-rpc-url
-      - ${RETH_RPC_URL:-http://reth:8546}
+      - http://reth:8546
       - --admin-base-url
       - http://eth_privatestate:8545
       - --admin-api-key
       - ${ADMIN_API_KEY}
       - --initial-sync-start-block
-      - ${INITIAL_SYNC_START_BLOCK:-1}
+      - "1"
+      - --initial-sync-end-block
+      - ${INITIAL_SYNC_END_BLOCK:-1000000}
       - --node-sync-mode
-      - ${NODE_SYNC_MODE:-roots-and-witness}
+      - roots-and-witness
+      - --skip-missing-node-sync

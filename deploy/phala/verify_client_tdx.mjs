@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, X509Certificate } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const DEFAULT_PHALA_VERIFY_API = 'https://cloud-api.phala.com/api/v1/attestations/verify';
+const DSTACK_RUNTIME_EVENT_TYPE = 0x08000001;
 
 function usage() {
   console.error(
-    'Usage: node deploy/phala/verify_client_tdx.mjs <app-base-url> [expected-mrtd] [--strict-digests] [--pccs-url <url>] [--verifier-bin <path>] [--dstack-verifier-url <url>] [--require-dstack-verifier] [--phala-api] [--simulator-fixture]'
+    'Usage: node deploy/phala/verify_client_tdx.mjs <app-base-url> [expected-mrtd] [--strict-digests] [--attested-tls] [--tls-domain <domain>] [--pccs-url <url>] [--verifier-bin <path>] [--dstack-verifier-url <url>] [--require-dstack-verifier] [--phala-api] [--simulator-fixture]'
   );
   console.error('Default behavior verifies the quote locally and does not call Phala.');
   console.error(
@@ -65,10 +66,22 @@ function eventLogEvents(eventLog) {
   return Array.isArray(eventLog) ? eventLog : [];
 }
 
+function parseJsonString(value) {
+  if (typeof value !== 'string') {
+    return value;
+  }
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
 function extractAppCompose(info) {
+  const tcbInfo = parseJsonString(info?.tcb_info ?? info?.tcbInfo);
   return (
-    info?.tcb_info?.app_compose ??
-    info?.tcbInfo?.appCompose ??
+    tcbInfo?.app_compose ??
+    tcbInfo?.appCompose ??
     info?.app_compose ??
     info?.appCompose ??
     null
@@ -105,6 +118,8 @@ function parseArgs(argv) {
     requireDstackVerifier: false,
     phalaApi: false,
     simulatorFixture: false,
+    attestedTls: false,
+    tlsDomain: process.env.ATTESTED_TLS_DOMAIN || '',
     pccsUrl: process.env.PCCS_URL || '',
     verifierBin: process.env.TDX_QUOTE_VERIFIER_BIN || '',
   };
@@ -119,6 +134,14 @@ function parseArgs(argv) {
       flags.phalaApi = true;
     } else if (arg === '--simulator-fixture') {
       flags.simulatorFixture = true;
+    } else if (arg === '--attested-tls') {
+      flags.attestedTls = true;
+    } else if (arg === '--tls-domain') {
+      flags.tlsDomain = argv[i + 1] || '';
+      i += 1;
+      if (!flags.tlsDomain) {
+        throw new Error('missing value for --tls-domain');
+      }
     } else if (arg === '--dstack-verifier-url') {
       flags.dstackVerifierUrl = argv[i + 1] || '';
       i += 1;
@@ -200,13 +223,105 @@ function verifyQuoteLocally({ quote, reportData, expectedMrtd, pccsUrl, verifier
   return JSON.parse(result.stdout);
 }
 
+function sha256Hex(data) {
+  return createHash('sha256').update(data).digest('hex');
+}
+
+function sha512Hex(data) {
+  return createHash('sha512').update(data).digest('hex');
+}
+
+function attestedTlsReportPayload(domain, certificateSha256, challenge) {
+  return `domain=${domain}\ncertificate_sha256=0x${certificateSha256}\nchallenge=0x${challenge}\n`;
+}
+
+function certificatePublicKeyPin(certificatePem) {
+  const certificate = new X509Certificate(certificatePem);
+  const spkiDer = certificate.publicKey.export({ type: 'spki', format: 'der' });
+  return `sha256//${createHash('sha256').update(spkiDer).digest('base64')}`;
+}
+
+async function verifyAttestedTlsCertificate(opts, info) {
+  const domain = (opts.tlsDomain || opts.appBaseUrl.hostname).toLowerCase();
+  const challenge = randomBytes(32).toString('hex');
+  const url = new URL('/attested_tls_cert', opts.appBaseUrl);
+  url.searchParams.set('domain', domain);
+  url.searchParams.set('challenge', `0x${challenge}`);
+
+  const response = await fetchJson(url);
+  const certificate = response.certificate;
+  if (typeof certificate !== 'string' || !certificate.includes('BEGIN CERTIFICATE')) {
+    throw new Error('/attested_tls_cert did not return a PEM certificate');
+  }
+  if (response.domain !== domain) {
+    throw new Error(`attested TLS domain mismatch: expected ${domain}, got ${response.domain}`);
+  }
+  if (normalizeHex(response.challenge, 'attested TLS challenge') !== challenge) {
+    throw new Error('attested TLS challenge mismatch');
+  }
+
+  const certificateSha256 = sha256Hex(certificate);
+  const reportedCertificateSha256 = normalizeHex(
+    response.certificate_sha256,
+    'attested TLS certificate_sha256'
+  );
+  if (certificateSha256 !== reportedCertificateSha256) {
+    throw new Error(
+      `attested TLS certificate hash mismatch: calculated ${certificateSha256}, reported ${reportedCertificateSha256}`
+    );
+  }
+
+  const reportData = sha512Hex(attestedTlsReportPayload(domain, certificateSha256, challenge));
+  const reportedReportData = normalizeHex(response.report_data, 'attested TLS report_data');
+  if (reportData !== reportedReportData) {
+    throw new Error(
+      `attested TLS report_data mismatch: calculated ${reportData}, reported ${reportedReportData}`
+    );
+  }
+
+  const attestation = response.attestation;
+  const localQuote = verifyQuoteLocally({
+    quote: attestation?.quote,
+    reportData,
+    expectedMrtd: opts.expectedMrtd,
+    pccsUrl: opts.pccsUrl,
+    verifierBin: opts.verifierBin,
+  });
+  verifyRtmr3EventLog(attestation, localQuote);
+  verifyComposeHash(info, attestation, opts.strictDigests);
+  const pin = certificatePublicKeyPin(certificate);
+  console.log('attested_tls_quote_verified=true');
+  console.log(`attested_tls_domain=${domain}`);
+  console.log(`attested_tls_certificate_sha256=0x${certificateSha256}`);
+  console.log(`attested_tls_pin=${pin}`);
+  return { pin, localQuote };
+}
+
+function eventDigest(event, imr) {
+  const eventType = Number(event.event_type ?? event.eventType);
+  if (Number(event.imr) === 3 && eventType === DSTACK_RUNTIME_EVENT_TYPE) {
+    const eventTypeBytes = Buffer.alloc(4);
+    eventTypeBytes.writeUInt32LE(eventType);
+    const payload = Buffer.from(
+      normalizeHex(event.event_payload ?? event.eventPayload ?? '', `event payload for imr${imr}`),
+      'hex'
+    );
+    const eventName = Buffer.from(event.event ?? '', 'utf8');
+    return createHash('sha384')
+      .update(Buffer.concat([eventTypeBytes, Buffer.from(':'), eventName, Buffer.from(':'), payload]))
+      .digest();
+  }
+
+  return Buffer.from(normalizeHex(event.digest, `event digest for imr${imr}`), 'hex');
+}
+
 function replayRtmr(events, imr) {
   let mr = Buffer.alloc(48, 0);
   for (const event of events) {
     if (Number(event.imr) !== imr) {
       continue;
     }
-    const digest = Buffer.from(normalizeHex(event.digest, `event digest for imr${imr}`), 'hex');
+    const digest = eventDigest(event, imr);
     if (digest.length > 48) {
       throw new Error(`event digest for imr${imr} is longer than 48 bytes`);
     }
@@ -335,6 +450,10 @@ async function main() {
     console.warn(`warning: /info unavailable, skipping compose checks: ${err.message}`);
   }
   verifyComposeHash(info, attestation, opts.strictDigests);
+
+  if (opts.attestedTls) {
+    await verifyAttestedTlsCertificate(opts, info);
+  }
 
   await verifyWithLocalDstackVerifier(
     opts.dstackVerifierUrl,

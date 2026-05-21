@@ -11,6 +11,29 @@ use tokio::sync::Mutex;
 use crate::authentication::{ApiKeyController, ApiKeyError};
 use crate::{oblivious_node::ObliviousNode, types::B256};
 
+pub const DEFAULT_ROOT_MAP_CAPACITY: usize = 1 << 20;
+pub const DEFAULT_NODE_MAP_CAPACITY: usize = 1 << 10;
+const DEFAULT_ADMIN_API_KEY: &str = "olabs-admin-dev-key-please-change";
+
+#[derive(Clone, Debug)]
+pub struct SharedStateConfig {
+  pub root_map_capacity: usize,
+  pub node_map_capacity: usize,
+  pub admin_api_key: String,
+  pub leaky_error_recovery: bool,
+}
+
+impl Default for SharedStateConfig {
+  fn default() -> Self {
+    Self {
+      root_map_capacity: DEFAULT_ROOT_MAP_CAPACITY,
+      node_map_capacity: DEFAULT_NODE_MAP_CAPACITY,
+      admin_api_key: DEFAULT_ADMIN_API_KEY.to_string(),
+      leaky_error_recovery: true,
+    }
+  }
+}
+
 #[derive(Clone, Debug, Serialize, Default)]
 pub struct RpcMetrics {
   pub requests_total: u64,
@@ -116,10 +139,58 @@ struct MissingProofGroupKey {
   block: MissingBlockId,
 }
 
+#[derive(Debug)]
+struct RootStore {
+  by_number: Vec<B256>,
+  number_present: Vec<bool>,
+  overflow_by_number: HashMap<u64, B256>,
+  by_hash: HashMap<B256, B256>,
+}
+
+impl RootStore {
+  fn new(number_capacity: usize) -> Self {
+    Self {
+      by_number: vec![B256::zero(); number_capacity],
+      number_present: vec![false; number_capacity],
+      overflow_by_number: HashMap::new(),
+      by_hash: HashMap::new(),
+    }
+  }
+
+  fn set_number(&mut self, block: u64, root: B256) {
+    if let Ok(index) = usize::try_from(block) {
+      if index < self.by_number.len() {
+        self.by_number[index] = root;
+        self.number_present[index] = true;
+        return;
+      }
+    }
+    self.overflow_by_number.insert(block, root);
+  }
+
+  fn get_number(&self, block: u64) -> Option<B256> {
+    if let Ok(index) = usize::try_from(block) {
+      if index < self.by_number.len() {
+        return self.number_present[index].then_some(self.by_number[index]);
+      }
+    }
+    self.overflow_by_number.get(&block).copied()
+  }
+
+  fn set_hash(&mut self, block_hash: B256, root: B256) {
+    self.by_hash.insert(block_hash, root);
+  }
+
+  fn get_hash(&self, block_hash: B256) -> Option<B256> {
+    self.by_hash.get(&block_hash).copied()
+  }
+}
+
 pub struct SharedState {
   pub storage: Arc<Mutex<UnsortedMap<B256, ObliviousNode>>>,
-  /// block_number -> state_root
-  pub roots_by_number: Arc<Mutex<UnsortedMap<u64, B256>>>,
+  /// NOTE(obliviousness): direct root lookup leaks the requested block selector.
+  /// This is a current performance tradeoff; proof-node traversal remains ORAM-backed.
+  roots: Arc<Mutex<RootStore>>,
   /// latest root set via `admin_set_root` (block_number, state_root)
   pub latest_root_by_number: Arc<Mutex<Option<(u64, B256)>>>,
   /// latest block root published by startup/historical root sync.
@@ -132,8 +203,6 @@ pub struct SharedState {
   pub latest_historical_node_delta_number: Arc<Mutex<Option<u64>>>,
   /// latest block whose live proactive node delta was applied.
   pub latest_live_node_delta_number: Arc<Mutex<Option<u64>>>,
-  /// block_hash -> state_root
-  pub roots_by_hash: Arc<Mutex<UnsortedMap<B256, B256>>>,
   /// NOTE(obliviousness): this cache is not secret-data-independent.
   /// It leaks block selector and duplicate status for `(address, block, storage_key)`
   /// via instruction and memory-access traces in map/set insertions.
@@ -147,15 +216,23 @@ pub struct SharedState {
 
 impl SharedState {
   pub fn new(cap: usize) -> Self {
-    Self::new_with_admin_key_and_leaky_error_recovery(
-      cap,
-      "olabs-admin-dev-key-please-change".to_string(),
-      true,
-    )
+    Self::with_config(SharedStateConfig { root_map_capacity: cap, ..Default::default() })
+  }
+
+  pub fn new_with_map_capacities(root_map_capacity: usize, node_map_capacity: usize) -> Self {
+    Self::with_config(SharedStateConfig {
+      root_map_capacity,
+      node_map_capacity,
+      ..Default::default()
+    })
   }
 
   pub fn new_with_admin_key(cap: usize, admin_api_key: String) -> Self {
-    Self::new_with_admin_key_and_leaky_error_recovery(cap, admin_api_key, true)
+    Self::with_config(SharedStateConfig {
+      root_map_capacity: cap,
+      admin_api_key,
+      ..Default::default()
+    })
   }
 
   pub fn new_with_admin_key_and_leaky_error_recovery(
@@ -163,78 +240,54 @@ impl SharedState {
     admin_api_key: String,
     leaky_error_recovery: bool,
   ) -> Self {
+    Self::with_config(SharedStateConfig {
+      root_map_capacity: cap,
+      admin_api_key,
+      leaky_error_recovery,
+      ..Default::default()
+    })
+  }
+
+  pub fn with_config(config: SharedStateConfig) -> Self {
     Self {
-      storage: Arc::new(Mutex::new(UnsortedMap::new(1 << 10))),
-      roots_by_number: Arc::new(Mutex::new(UnsortedMap::new(cap))),
+      storage: Arc::new(Mutex::new(UnsortedMap::new(config.node_map_capacity))),
+      roots: Arc::new(Mutex::new(RootStore::new(config.root_map_capacity))),
       latest_root_by_number: Arc::new(Mutex::new(None)),
       latest_historical_root_number: Arc::new(Mutex::new(None)),
       latest_live_root_number: Arc::new(Mutex::new(None)),
       latest_node_delta_number: Arc::new(Mutex::new(None)),
       latest_historical_node_delta_number: Arc::new(Mutex::new(None)),
       latest_live_node_delta_number: Arc::new(Mutex::new(None)),
-      roots_by_hash: Arc::new(Mutex::new(UnsortedMap::new(cap))),
       missing_proof_queries: Arc::new(Mutex::new(HashMap::new())),
-      leaky_error_recovery,
+      leaky_error_recovery: config.leaky_error_recovery,
       metrics: Arc::new(Mutex::new(RpcMetrics::default())),
-      api_keys: Arc::new(Mutex::new(ApiKeyController::new(admin_api_key))),
+      api_keys: Arc::new(Mutex::new(ApiKeyController::new(config.admin_api_key))),
     }
   }
 
   pub async fn set_root(&self, block: u64, root: B256) {
-    let mut guard = self.roots_by_number.lock().await;
-    let mut existing = B256::zero();
-    if guard.get(block, &mut existing) {
-      guard.write(block, root);
-    } else {
-      guard.insert(block, root);
-    }
-    for _ in 0..16 {
-      guard.deamortize_insertion_queue();
-    }
+    self.roots.lock().await.set_number(block, root);
 
     let mut latest_guard = self.latest_root_by_number.lock().await;
     let should_update =
-      latest_guard.as_ref().map_or(true, |(latest_block, _)| block >= *latest_block);
+      latest_guard.as_ref().is_none_or(|(latest_block, _)| block >= *latest_block);
     if should_update {
       *latest_guard = Some((block, root));
     }
   }
 
-  // NOTE: We are leaking whether the root exists or not, this is acceptable as we don't care about hiding data in invalid requests.
+  // NOTE: This direct lookup leaks the requested block number and whether the root exists.
   pub async fn get_root(&self, block: u64) -> Option<B256> {
-    let mut guard = self.roots_by_number.lock().await;
-    let mut ret = B256::zero();
-    let v = guard.get(block, &mut ret);
-    if v {
-      Some(ret)
-    } else {
-      None
-    }
+    self.roots.lock().await.get_number(block)
   }
 
   pub async fn set_root_by_hash(&self, block_hash: B256, root: B256) {
-    let mut guard = self.roots_by_hash.lock().await;
-    let mut existing = B256::zero();
-    if guard.get(block_hash, &mut existing) {
-      guard.write(block_hash, root);
-    } else {
-      guard.insert(block_hash, root);
-    }
-    for _ in 0..16 {
-      guard.deamortize_insertion_queue();
-    }
+    self.roots.lock().await.set_hash(block_hash, root);
   }
 
-  // NOTE: We are leaking whether the root exists or not, this is acceptable as we don't care about hiding data in invalid requests.
+  // NOTE: This direct lookup leaks the requested block hash and whether the root exists.
   pub async fn get_root_by_hash(&self, block_hash: B256) -> Option<B256> {
-    let mut guard = self.roots_by_hash.lock().await;
-    let mut ret = B256::zero();
-    let v = guard.get(block_hash, &mut ret);
-    if v {
-      Some(ret)
-    } else {
-      None
-    }
+    self.roots.lock().await.get_hash(block_hash)
   }
 
   pub async fn get_latest_root(&self) -> Option<B256> {
@@ -256,56 +309,40 @@ impl SharedState {
     }
 
     {
-      let mut guard = self.roots_by_hash.lock().await;
+      let mut guard = self.roots.lock().await;
       for (_, block_hash, root) in roots {
-        let mut existing = B256::zero();
-        if guard.get(*block_hash, &mut existing) {
-          guard.write(*block_hash, *root);
-        } else {
-          guard.insert(*block_hash, *root);
-        }
+        guard.set_hash(*block_hash, *root);
       }
-      for _ in 0..roots.len().saturating_mul(16) {
-        guard.deamortize_insertion_queue();
-      }
-    }
 
-    let mut latest_in_batch: Option<(u64, B256)> = None;
-    if publish_root_by_number {
-      let mut guard = self.roots_by_number.lock().await;
-      for (block, _, root) in roots {
-        let mut existing = B256::zero();
-        if guard.get(*block, &mut existing) {
-          guard.write(*block, *root);
-        } else {
-          guard.insert(*block, *root);
-        }
-        if latest_in_batch.map_or(true, |(latest, _)| *block >= latest) {
-          latest_in_batch = Some((*block, *root));
-        }
-      }
-      for _ in 0..roots.len().saturating_mul(16) {
-        guard.deamortize_insertion_queue();
-      }
-    } else {
-      for (block, _, root) in roots {
-        if latest_in_batch.map_or(true, |(latest, _)| *block >= latest) {
-          latest_in_batch = Some((*block, *root));
-        }
-      }
-    }
-
-    if let Some((block, root)) = latest_in_batch {
+      let mut latest_in_batch: Option<(u64, B256)> = None;
       if publish_root_by_number {
-        let mut latest_guard = self.latest_root_by_number.lock().await;
-        let should_update =
-          latest_guard.as_ref().map_or(true, |(latest_block, _)| block >= *latest_block);
-        if should_update {
-          *latest_guard = Some((block, root));
+        for (block, _, root) in roots {
+          guard.set_number(*block, *root);
+          if latest_in_batch.is_none_or(|(latest, _)| *block >= latest) {
+            latest_in_batch = Some((*block, *root));
+          }
+        }
+      } else {
+        for (block, _, root) in roots {
+          if latest_in_batch.is_none_or(|(latest, _)| *block >= latest) {
+            latest_in_batch = Some((*block, *root));
+          }
         }
       }
-      if let Some(lane) = lane {
-        self.mark_root_progress(block, lane).await;
+      drop(guard);
+
+      if let Some((block, root)) = latest_in_batch {
+        if publish_root_by_number {
+          let mut latest_guard = self.latest_root_by_number.lock().await;
+          let should_update =
+            latest_guard.as_ref().is_none_or(|(latest_block, _)| block >= *latest_block);
+          if should_update {
+            *latest_guard = Some((block, root));
+          }
+        }
+        if let Some(lane) = lane {
+          self.mark_root_progress(block, lane).await;
+        }
       }
     }
   }
@@ -316,7 +353,7 @@ impl SharedState {
       SyncProgressLane::Live => &self.latest_live_root_number,
     };
     let mut guard = target.lock().await;
-    if guard.map_or(true, |latest| block >= latest) {
+    if guard.is_none_or(|latest| block >= latest) {
       *guard = Some(block);
     }
   }
@@ -335,13 +372,13 @@ impl SharedState {
       SyncProgressLane::Live => &self.latest_live_node_delta_number,
     };
     let mut lane_guard = target.lock().await;
-    if lane_guard.map_or(true, |latest| block >= latest) {
+    if lane_guard.is_none_or(|latest| block >= latest) {
       *lane_guard = Some(block);
     }
     drop(lane_guard);
 
     let mut guard = self.latest_node_delta_number.lock().await;
-    if guard.map_or(true, |latest| block >= latest) {
+    if guard.is_none_or(|latest| block >= latest) {
       *guard = Some(block);
     }
   }

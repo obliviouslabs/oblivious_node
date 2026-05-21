@@ -83,6 +83,13 @@ keeps crawling historical and live witness nodes in background. Early
 `eth_getProof` calls can still return `-32001` data non availability, but those
 failed requests are queued for missing-node backfill, which now fetches the proof
 directly from reth and publishes both proof nodes and the missing block root.
+Set `ROOT_MAP_CAPACITY` above the Sepolia chain height, for example `12000000`.
+Set `NODE_MAP_CAPACITY` based on CVM memory: `16777216` trie nodes is not about
+1 GB in this ORAM layout; the raw node values alone are roughly 9.4 GB before
+keys, buckets, ORAM storage, and position-map overhead.
+Current privacy tradeoff: the root maps use direct lookups, so the requested
+block selector is visible. Address and storage-key proof traversal still uses
+the ORAM-backed trie-node map.
 
 The Phala default `2 vCPU / 4096 MB / 40 GB` prompt is only realistic for the
 phase1 smoke test. For Sepolia, choose the smallest CVM size with enough disk for
@@ -95,6 +102,7 @@ fails or stalls.
 - Public RPC: `https://<node-info-domain>/{api_key}/json_rpc`
 - Admin RPC: `https://<node-info-domain>/{admin_api_key}/admin`
 - TDX quote: `https://<node-info-domain>/attestation?report_data=0x<0-to-64-byte-hex>`
+- Attested TLS cert: `https://<node-info-domain>/attested_tls_cert?domain=<domain>&challenge=0x<32-byte-hex>`
 - dstack info: `https://<node-info-domain>/info`
 
 ## Verify TDX Image Locally
@@ -112,6 +120,15 @@ This does not call Phala by default. It:
 - checks the quote `reportData` binds to the client challenge
 - replays RTMR3 from the event log and compares it to the quoted RTMR3
 - checks compose-hash and image digest pinning when `/info` exposes app compose data
+
+For an HTTPS channel pinned to the cert that the enclave attested, add:
+
+```bash
+node deploy/phala/verify_client_tdx.mjs "https://<node-info-domain>" \
+  --strict-digests \
+  --attested-tls \
+  --tls-domain <node-info-domain>
+```
 
 2) Optional complete local platform verification with Phala/dstack's local verifier:
 

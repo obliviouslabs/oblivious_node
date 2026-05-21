@@ -12,7 +12,8 @@ use tokio::task::JoinSet;
 use crate::reth_source::{RethBlockBundle, RethNotification, RethUpdateProvider};
 use crate::{FeederFuture, MissingProofBackfill, SyncLane};
 
-const INITIAL_SYNC_BATCH_BLOCKS: u64 = 1024;
+const INITIAL_SYNC_BATCH_BLOCKS: u64 = 256;
+const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const WITNESS_FETCH_CONCURRENCY: usize = 4;
 const WITNESS_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -24,7 +25,9 @@ struct RethRpcClient {
 
 impl RethRpcClient {
   fn new(rpc_url: String) -> Self {
-    Self { rpc_url, client: reqwest::Client::new() }
+    let client =
+      reqwest::Client::builder().timeout(RPC_TIMEOUT).build().expect("valid reqwest client");
+    Self { rpc_url, client }
   }
 
   async fn call(&self, method: &str, params: Value) -> io::Result<Value> {
@@ -271,6 +274,7 @@ pub struct RethRpcSource {
   node_sync_mode: NodeSyncMode,
   bootstrap_tip: Option<u64>,
   bootstrap_next_block: u64,
+  bootstrap_end_block: Option<u64>,
   bootstrap_tail_blocks: Option<u64>,
   bootstrap_last_state_root_hex: Option<String>,
   bootstrap_last_state_root_complete: bool,
@@ -293,6 +297,7 @@ impl RethRpcSource {
       node_sync_mode: NodeSyncMode::RootsOnly,
       bootstrap_tip: None,
       bootstrap_next_block: start_block.max(1),
+      bootstrap_end_block: None,
       bootstrap_tail_blocks: None,
       bootstrap_last_state_root_hex: None,
       bootstrap_last_state_root_complete: false,
@@ -309,6 +314,7 @@ impl RethRpcSource {
       node_sync_mode: NodeSyncMode::RootsOnly,
       bootstrap_tip: None,
       bootstrap_next_block: 1,
+      bootstrap_end_block: None,
       bootstrap_tail_blocks: Some(tail_blocks.max(1)),
       bootstrap_last_state_root_hex: None,
       bootstrap_last_state_root_complete: false,
@@ -326,6 +332,7 @@ impl RethRpcSource {
       node_sync_mode: NodeSyncMode::RootsOnly,
       bootstrap_tip: None,
       bootstrap_next_block: 1,
+      bootstrap_end_block: None,
       bootstrap_tail_blocks: None,
       bootstrap_last_state_root_hex: None,
       bootstrap_last_state_root_complete: false,
@@ -348,6 +355,12 @@ impl RethRpcSource {
   /// Sets the proactive node ingestion strategy.
   pub fn with_node_sync_mode(mut self, node_sync_mode: NodeSyncMode) -> Self {
     self.node_sync_mode = node_sync_mode;
+    self
+  }
+
+  /// Caps startup/bootstrap sync at an inclusive block number.
+  pub fn with_bootstrap_end_block(mut self, end_block: Option<u64>) -> Self {
+    self.bootstrap_end_block = end_block;
     self
   }
 
@@ -553,7 +566,10 @@ impl RethUpdateProvider for RethRpcSource {
       match self.mode {
         SourceMode::Bootstrap => {
           if self.bootstrap_tip.is_none() {
-            let tip = self.rpc.block_number().await?;
+            let mut tip = self.rpc.block_number().await?;
+            if let Some(end_block) = self.bootstrap_end_block {
+              tip = tip.min(end_block);
+            }
             self.bootstrap_tip = Some(tip);
             if let Some(tail_blocks) = self.bootstrap_tail_blocks {
               let start = tip.saturating_sub(tail_blocks.saturating_sub(1)).max(1);

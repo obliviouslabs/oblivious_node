@@ -31,7 +31,7 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -A missing-docs
       - name: Run codespell
-        run: codespell --quiet-level=2 --skip="backup,target,.git"
+        run: codespell --quiet-level=2 --skip="backup,target,.git" -L inout
 
   test:
     name: Run tests
@@ -46,6 +46,20 @@ jobs:
         with:
           cache-on-failure: true
       - uses: taiki-e/install-action@nextest
+      - name: Install reth test binary
+        run: |
+          set -euo pipefail
+          image="ghcr.io/paradigmxyz/reth@sha256:505fca5e87d6411fc7117f29a87e42787ec2eebe8225506e9ddb4759ae2ba5cc"
+          mkdir -p /tmp/reth-bin
+          cid="$(docker create --entrypoint /bin/sh "$image" -c true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          if docker cp "$cid:/usr/local/bin/reth" /tmp/reth-bin/reth 2>/dev/null; then
+            :
+          else
+            docker cp "$cid:/usr/bin/reth" /tmp/reth-bin/reth
+          fi
+          chmod +x /tmp/reth-bin/reth
+          /tmp/reth-bin/reth --version
       - name: Run tests (collect JUnit)
         run: cargo nextest run --workspace --no-fail-fast --profile ci
       - name: Upload test results to Codecov (optional)
@@ -69,6 +83,20 @@ jobs:
           cache-on-failure: true
       - uses: taiki-e/install-action@nextest
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install reth test binary
+        run: |
+          set -euo pipefail
+          image="ghcr.io/paradigmxyz/reth@sha256:505fca5e87d6411fc7117f29a87e42787ec2eebe8225506e9ddb4759ae2ba5cc"
+          mkdir -p /tmp/reth-bin
+          cid="$(docker create --entrypoint /bin/sh "$image" -c true)"
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          if docker cp "$cid:/usr/local/bin/reth" /tmp/reth-bin/reth 2>/dev/null; then
+            :
+          else
+            docker cp "$cid:/usr/bin/reth" /tmp/reth-bin/reth
+          fi
+          chmod +x /tmp/reth-bin/reth
+          /tmp/reth-bin/reth --version
       - name: Run coverage (llvm-cov)
         run: cargo llvm-cov --lcov --output-path target/lcov.info nextest --workspace --no-fail-fast
       - name: Upload coverage to Codecov

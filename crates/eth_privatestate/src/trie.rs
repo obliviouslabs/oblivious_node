@@ -9,7 +9,7 @@ use rostl_primitives::traits::Cmov;
 use tokio::sync::Mutex;
 
 use crate::oblivious_node::{ObliviousNode, NODE_BUF, VALUE_BUF};
-use crate::types::{bytes_to_hex_oblivious_hidden_size_quoted, B256};
+use crate::types::{bytes_to_quantity_oblivious_quoted_left_padded, B256};
 
 const MAX_SLOTS: usize = 16;
 const EMPTY_STORAGE_ROOT: B256 = B256([
@@ -94,7 +94,13 @@ pub async fn generate_proof<const ADDR_LEN: usize>(
 
 pub fn parse_account(rlp_bytes: &[u8]) -> (String, String, B256, B256) {
   if rlp_bytes.iter().all(|byte| *byte == 0) {
-    return ("\"0x0\"".to_string(), "\"0x0\"".to_string(), EMPTY_STORAGE_ROOT, EMPTY_CODE_HASH);
+    let zero = [0u8; 32];
+    return (
+      bytes_to_quantity_oblivious_quoted_left_padded(&zero, 0),
+      bytes_to_quantity_oblivious_quoted_left_padded(&zero, 0),
+      EMPTY_STORAGE_ROOT,
+      EMPTY_CODE_HASH,
+    );
   }
 
   let rlp_bytes = &rlp_bytes[2..];
@@ -121,8 +127,8 @@ pub fn parse_account(rlp_bytes: &[u8]) -> (String, String, B256, B256) {
   oblivious_memcpy(&mut s_code_hash, rlp_bytes, start_code_hash);
 
   (
-    bytes_to_hex_oblivious_hidden_size_quoted(&s_nonce, size_nonce),
-    bytes_to_hex_oblivious_hidden_size_quoted(&s_balance, size_balance),
+    bytes_to_quantity_oblivious_quoted_left_padded(&s_nonce, size_nonce),
+    bytes_to_quantity_oblivious_quoted_left_padded(&s_balance, size_balance),
     B256(s_storage_root),
     B256(s_code_hash),
   )
@@ -133,13 +139,18 @@ pub fn parse_account(rlp_bytes: &[u8]) -> (String, String, B256, B256) {
 /// Leaks: `rlp_bytes.len()`.
 pub fn parse_value(rlp_bytes: &[u8]) -> String {
   if rlp_bytes.iter().all(|byte| *byte == 0) {
-    return "\"0x0\"".to_string();
+    return bytes_to_quantity_oblivious_quoted_left_padded(rlp_bytes, 0);
   }
 
-  let mut rlp_bytes_local = vec![0u8; rlp_bytes.len()];
-  let (_tp, size, _start) = ObliviousNode::rlp_decode_type_and_size(rlp_bytes, 0);
-  oblivious_memcpy(&mut rlp_bytes_local, rlp_bytes, _start);
-  bytes_to_hex_oblivious_hidden_size_quoted(&rlp_bytes_local, size.min(rlp_bytes_local.len()))
+  let mut storage_value_rlp = vec![0u8; rlp_bytes.len()];
+  let (_outer_tp, _outer_size, outer_start) = ObliviousNode::rlp_decode_type_and_size(rlp_bytes, 0);
+  oblivious_memcpy(&mut storage_value_rlp, rlp_bytes, outer_start);
+
+  let mut value = vec![0u8; rlp_bytes.len()];
+  let (_inner_tp, inner_size, inner_start) =
+    ObliviousNode::rlp_decode_type_and_size(&storage_value_rlp, 0);
+  oblivious_memcpy(&mut value, &storage_value_rlp, inner_start);
+  bytes_to_quantity_oblivious_quoted_left_padded(&value, inner_size.min(value.len()))
 }
 
 #[cfg(test)]
@@ -213,8 +224,8 @@ mod tests {
   fn test_parse_account_non_member_returns_empty_account_defaults() {
     let (nonce, balance, storage_hash, code_hash) = parse_account(&[0u8; VALUE_BUF]);
 
-    assert_eq!(nonce, "\"0x0\"");
-    assert_eq!(balance, "\"0x0\"");
+    assert_eq!(serde_json::from_str::<String>(&nonce).unwrap(), "0x0");
+    assert_eq!(serde_json::from_str::<String>(&balance).unwrap(), "0x0");
     assert_eq!(storage_hash, EMPTY_STORAGE_ROOT);
     assert_eq!(code_hash, EMPTY_CODE_HASH);
   }
@@ -233,15 +244,15 @@ mod tests {
 
     let (nonce, balance, storage_hash, code_hash) = parse_account(&value);
 
-    assert_eq!(nonce.trim_end(), "\"0x0\"");
-    assert_eq!(balance.trim_end(), "\"0x0\"");
+    assert_eq!(serde_json::from_str::<String>(&nonce).unwrap(), "0x0");
+    assert_eq!(serde_json::from_str::<String>(&balance).unwrap(), "0x0");
     assert_eq!(storage_hash, EMPTY_STORAGE_ROOT);
     assert_eq!(code_hash, EMPTY_CODE_HASH);
   }
 
   #[test]
   fn test_parse_value_non_member_returns_zero_quantity() {
-    assert_eq!(parse_value(&[0u8; VALUE_BUF]), "\"0x0\"");
+    assert_eq!(serde_json::from_str::<String>(&parse_value(&[0u8; VALUE_BUF])).unwrap(), "0x0");
   }
 
   #[tokio::test]
@@ -471,15 +482,17 @@ mod tests {
   fn test_parse_value() {
     let cases: Vec<(&str, &str)> = vec![
       // Empty payload
-      ("80", "\"0x\""),
+      ("8180", "0x0"),
+      // Single-byte payloads below 0x80 are their own inner and outer RLP.
+      ("12", "0x12"),
       // 2-byte payload
-      ("821234", "\"0x1234\""),
-      // Leading-zero byte should remain visible (no canonical trimming)
-      ("82000f", "\"0x000f\""),
+      ("83821234", "0x1234"),
+      // Quantity output must not contain leading zero bytes or nibbles.
+      ("8382000f", "0xf"),
       // Full 32-byte payload (hardcoded RLP string)
       (
-        "a0000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        "\"0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\"",
+        "a1a0000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "0x102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
       ),
     ];
 
@@ -494,7 +507,10 @@ mod tests {
       } else {
         out_len = Some(v.len());
       }
-      assert_eq!(v.trim_end_matches(' '), expected_visible);
+      let parsed: String =
+        serde_json::from_str(&v).expect("parse_value should emit raw JSON string");
+      assert_eq!(parsed, expected_visible);
+      assert_eq!(v.as_bytes()[v.len() - 1], b'"', "closing quote should be fixed at end");
     }
   }
 
@@ -504,8 +520,9 @@ mod tests {
     #[test]
     fn prop_parse_value_fixed_shape_and_len(input in proptest::collection::vec(any::<u8>(), 3..=64)) {
       let out = parse_value(&input);
-      prop_assert_eq!(out.len(), 3 + (input.len() * 2));
-      prop_assert!(out.starts_with("\"0x"));
+      prop_assert_eq!(out.len(), 4 + (input.len() * 2));
+      let parsed: String = serde_json::from_str(&out).expect("parse_value should emit raw JSON string");
+      prop_assert!(parsed.starts_with("0x"));
     }
 
     #[test]

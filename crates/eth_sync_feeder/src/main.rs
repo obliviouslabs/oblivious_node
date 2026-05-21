@@ -17,6 +17,10 @@ const LIVE_NODE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MISSING_NODE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const LIVE_START_OVERLAP_BLOCKS: u64 = 64;
 
+fn redact_admin_key(message: impl ToString, admin_api_key: &str) -> String {
+  message.to_string().replace(admin_api_key, "<admin-api-key>")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum CliNodeSyncMode {
   /// Publish roots only and fetch proof nodes lazily on missing-query backfill.
@@ -66,6 +70,9 @@ struct Args {
   /// Bootstrap only the last N blocks at startup tip.
   #[arg(long)]
   initial_sync_tail_blocks: Option<u64>,
+  /// Cap startup/bootstrap sync at this inclusive block.
+  #[arg(long)]
+  initial_sync_end_block: Option<u64>,
   /// Proactive node ingest mode.
   #[arg(long, value_enum, default_value_t = CliNodeSyncMode::RootsAndWitness)]
   node_sync_mode: CliNodeSyncMode,
@@ -81,9 +88,18 @@ async fn main() -> Result<()> {
       "--initial-sync-start-block and --initial-sync-tail-blocks are mutually exclusive"
     );
   }
+  if args.initial_sync_end_block.is_some() && args.initial_sync_tail_blocks.is_some() {
+    anyhow::bail!("--initial-sync-end-block and --initial-sync-tail-blocks are mutually exclusive");
+  }
+  if let (Some(start), Some(end)) = (args.initial_sync_start_block, args.initial_sync_end_block) {
+    if end < start.max(1) {
+      anyhow::bail!("--initial-sync-end-block must be >= --initial-sync-start-block");
+    }
+  }
 
   let root_node_sync_mode = NodeSyncMode::from(args.node_sync_mode);
   let spawn_background_witness = args.node_sync_mode == CliNodeSyncMode::RootsAndWitness;
+  let admin_api_key_for_logs = args.admin_api_key.clone();
   info!("node sync mode: {:?}", args.node_sync_mode);
 
   let startup_rpc_source = match (args.initial_sync_start_block, args.initial_sync_tail_blocks) {
@@ -101,6 +117,7 @@ async fn main() -> Result<()> {
     }
     (Some(_), Some(_)) => unreachable!("validated mutually exclusive startup options"),
   }
+  .with_bootstrap_end_block(args.initial_sync_end_block)
   .with_node_sync_mode(root_node_sync_mode);
   let startup_source = RethSourceAdapter::new(startup_rpc_source);
   let startup_sink = HttpAdminSink::from_base_url(&args.admin_base_url, &args.admin_api_key)?;
@@ -137,15 +154,29 @@ async fn main() -> Result<()> {
     info!("feeder idle mode: only startup root sync (if enabled) + waiting for shutdown");
   }
 
+  let startup_log_key = admin_api_key_for_logs.clone();
   let mut startup_root_handle = tokio::spawn(async move {
     if skip_initial_sync {
       return;
     }
-    match startup_client.sync_initial_state().await {
-      Ok(startup) => {
-        info!("startup root sync completed in background (published {} block root(s))", startup)
+    loop {
+      match startup_client.sync_initial_state().await {
+        Ok(0) => {
+          info!("startup root sync found no blocks yet; retrying");
+          tokio::time::sleep(RETRY_SLEEP).await;
+        }
+        Ok(startup) => {
+          info!("startup root sync completed in background (published {} block root(s))", startup);
+          break;
+        }
+        Err(err) => {
+          error!(
+            "startup root sync failed: {}; retrying",
+            redact_admin_key(&err, &startup_log_key)
+          );
+          tokio::time::sleep(RETRY_SLEEP).await;
+        }
       }
-      Err(err) => error!("startup root sync failed: {}", err),
     }
   });
   let mut startup_root_finished = false;
@@ -162,21 +193,36 @@ async fn main() -> Result<()> {
         (None, None) => RethRpcSource::bootstrap_from_genesis(args.reth_rpc_url.clone()),
         (Some(_), Some(_)) => unreachable!("validated mutually exclusive startup options"),
       }
+      .with_bootstrap_end_block(args.initial_sync_end_block)
       .with_node_sync_mode(NodeSyncMode::ExecutionWitness);
     let historical_node_source = RethSourceAdapter::new(historical_node_source);
     let historical_node_sink =
       HttpAdminSink::from_base_url(&args.admin_base_url, &args.admin_api_key)?;
     let mut historical_node_client =
       RethSyncClient::new(historical_node_source, historical_node_sink, true);
+    let historical_log_key = admin_api_key_for_logs.clone();
     Some(tokio::spawn(async move {
-      match historical_node_client.sync_initial_state().await {
-        Ok(blocks) => {
-          info!(
-            "historical witness node sync completed in background (published {} block bundle(s))",
-            blocks
-          )
+      loop {
+        match historical_node_client.sync_initial_state().await {
+          Ok(0) => {
+            info!("historical witness node sync found no blocks yet; retrying");
+            tokio::time::sleep(RETRY_SLEEP).await;
+          }
+          Ok(blocks) => {
+            info!(
+              "historical witness node sync completed in background (published {} block bundle(s))",
+              blocks
+            );
+            break;
+          }
+          Err(err) => {
+            error!(
+              "historical witness node sync failed: {}; retrying",
+              redact_admin_key(&err, &historical_log_key)
+            );
+            tokio::time::sleep(RETRY_SLEEP).await;
+          }
         }
-        Err(err) => error!("historical witness node sync failed: {}", err),
       }
     }))
   } else {
@@ -191,12 +237,13 @@ async fn main() -> Result<()> {
     );
     let live_node_sink = HttpAdminSink::from_base_url(&args.admin_base_url, &args.admin_api_key)?;
     let mut live_node_client = RethSyncClient::new(live_node_source, live_node_sink, true);
+    let live_node_log_key = admin_api_key_for_logs.clone();
     Some(tokio::spawn(async move {
       let mut live_node_tick = tokio::time::interval(LIVE_NODE_POLL_INTERVAL);
       loop {
         live_node_tick.tick().await;
         if let Err(err) = live_node_client.sync_next_update().await {
-          error!("live witness node sync failed: {}", err);
+          error!("live witness node sync failed: {}", redact_admin_key(&err, &live_node_log_key));
           tokio::time::sleep(RETRY_SLEEP).await;
         }
       }
@@ -217,7 +264,7 @@ async fn main() -> Result<()> {
       }
       _ = live_tick.tick(), if !skip_live_sync => {
         if let Err(err) = live_client.sync_next_update().await {
-          error!("sync update failed: {}", err);
+          error!("sync update failed: {}", redact_admin_key(&err, &admin_api_key_for_logs));
           tokio::time::sleep(RETRY_SLEEP).await;
         }
       }
@@ -234,7 +281,7 @@ async fn main() -> Result<()> {
             }
           }
           Err(err) => {
-            error!("missing-node sync failed: {}", err);
+            error!("missing-node sync failed: {}", redact_admin_key(&err, &admin_api_key_for_logs));
             tokio::time::sleep(RETRY_SLEEP).await;
           }
         }

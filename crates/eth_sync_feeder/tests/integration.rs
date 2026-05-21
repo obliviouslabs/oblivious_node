@@ -549,12 +549,13 @@ fn storage_value_last_byte_from_proof_response(resp: &Value) -> io::Result<u8> {
     .and_then(Value::as_str)
     .ok_or_else(|| io_err("missing result.storageProof[0].value"))?;
 
-  let raw = value.strip_prefix("0x").unwrap_or(value).trim_end_matches(' ');
+  let raw = value.strip_prefix("0x").unwrap_or(value).trim();
+  let raw = raw.trim_start_matches('0');
   if raw.is_empty() {
     return Ok(0);
   }
-  let bytes = hex::decode(raw).map_err(io_err_from)?;
-  Ok(*bytes.last().unwrap_or(&0))
+  let low_byte = if raw.len() > 2 { &raw[raw.len() - 2..] } else { raw };
+  u8::from_str_radix(low_byte, 16).map_err(io_err_from)
 }
 
 async fn wait_for_proof_value_byte(

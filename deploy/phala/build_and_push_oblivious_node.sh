@@ -27,7 +27,7 @@ docker buildx build \
   --push \
   .
 
-DIGEST="$(docker buildx imagetools inspect "${IMAGE_TAG_REF}" | awk '/Digest: sha256:/{print $2; exit}')"
+DIGEST="$(docker buildx imagetools inspect "${IMAGE_TAG_REF}" | awk '$1 == "Digest:" { digest = $2 } END { print digest }')"
 if [[ -z "${DIGEST}" ]]; then
   echo "Failed to resolve digest for ${IMAGE_TAG_REF}" >&2
   exit 1
